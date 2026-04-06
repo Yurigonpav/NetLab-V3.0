@@ -1,0 +1,141 @@
+/* tema_escuro.qss — Folha de estilo para o NetLab Educacional */
+
+QMainWindow, QWidget {
+    background-color: #0f1423;
+    color: #ecf0f1;
+    font-family: "Segoe UI", Arial, sans-serif;
+    font-size: 11px;
+}
+
+QMenuBar {
+    background-color: #12162a;
+    color: #ecf0f1;
+    border-bottom: 1px solid #1e2d40;
+    padding: 2px;
+}
+QMenuBar::item:selected { background-color: #1e2d40; }
+
+QMenu {
+    background-color: #12162a;
+    color: #ecf0f1;
+    border: 1px solid #1e2d40;
+}
+QMenu::item:selected { background-color: #1e3a5f; }
+
+QToolBar {
+    background-color: #12162a;
+    border-bottom: 1px solid #1e2d40;
+    padding: 4px 6px;
+    spacing: 6px;
+}
+
+QTabWidget::pane {
+    border: 1px solid #1e2d40;
+    background-color: #0f1423;
+}
+QTabBar::tab {
+    background-color: #12162a;
+    color: #7f8c8d;
+    padding: 8px 18px;
+    border: 1px solid #1e2d40;
+    border-bottom: none;
+    margin-right: 2px;
+    border-radius: 4px 4px 0 0;
+}
+QTabBar::tab:selected {
+    background-color: #1e3a5f;
+    color: #ecf0f1;
+    border-bottom: 2px solid #3498DB;
+}
+QTabBar::tab:hover { background-color: #1a2540; }
+
+QPushButton {
+    background-color: #1e3a5f;
+    color: #ecf0f1;
+    border: 1px solid #2e5f8a;
+    border-radius: 5px;
+    padding: 6px 14px;
+}
+QPushButton:hover   { background-color: #2a5080; }
+QPushButton:pressed { background-color: #1a3050; }
+
+QPushButton#botao_captura {
+    background-color: #1a5c2e;
+    border-color: #27ae60;
+    color: #ecf0f1;
+}
+QPushButton#botao_captura:hover { background-color: #207a3a; }
+
+QPushButton#botao_parar {
+    background-color: #7b1a1a;
+    border-color: #c0392b;
+    color: #ecf0f1;
+}
+QPushButton#botao_parar:hover { background-color: #a02020; }
+
+QComboBox {
+    background-color: #12162a;
+    color: #ecf0f1;
+    border: 1px solid #1e2d40;
+    border-radius: 4px;
+    padding: 4px 8px;
+}
+QComboBox::drop-down { border: none; }
+QComboBox QAbstractItemView {
+    background-color: #12162a;
+    color: #ecf0f1;
+    selection-background-color: #1e3a5f;
+}
+
+QTableWidget {
+    background-color: #0d1120;
+    color: #ecf0f1;
+    gridline-color: #1e2d40;
+    border: 1px solid #1e2d40;
+    border-radius: 4px;
+}
+QTableWidget::item:selected { background-color: #1e3a5f; }
+QTableWidget::item:alternate { background-color: #10152a; }
+QHeaderView::section {
+    background-color: #12162a;
+    color: #7f8c8d;
+    padding: 6px;
+    border: 1px solid #1e2d40;
+    font-weight: bold;
+    font-size: 10px;
+}
+
+QScrollBar:vertical {
+    background-color: #0f1423;
+    width: 10px;
+    border-radius: 5px;
+}
+QScrollBar::handle:vertical {
+    background-color: #2c3e50;
+    border-radius: 5px;
+}
+QScrollBar::handle:vertical:hover { background-color: #3d5166; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+
+QStatusBar {
+    background-color: #0a0e1a;
+    color: #7f8c8d;
+    border-top: 1px solid #1e2d40;
+    padding: 2px 6px;
+}
+
+QSplitter::handle { background-color: #1e2d40; width: 2px; }
+
+QPushButton#botao_servidor_off {
+    background-color: #1a3a5c;
+    border-color: #2980B9;
+    color: #ecf0f1;
+}
+QPushButton#botao_servidor_off:hover { background-color: #22527a; }
+
+QPushButton#botao_servidor_on {
+    background-color: #5c1a1a;
+    border-color: #E74C3C;
+    color: #ecf0f1;
+}
+QPushButton#botao_servidor_on:hover { background-color: #7a2222; }
