@@ -18,6 +18,8 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSlot
 from PyQt6.QtGui import QFont, QColor
+from utils.constantes import CLASSIFICACAO_USO
+from utils.rede import formatar_bytes, corrigir_mojibake
 
 
 # ─────────────────────────────────────────────────────────────
@@ -63,23 +65,6 @@ DOMINIOS_CONHECIDOS = {
     "slack.com": "Slack",             "dropbox.com": "Dropbox",
     "drive.google.com": "Google Drive",
 }
-
-# Classificação de tipo de uso por evento
-CLASSIFICACAO_USO = {
-    "DNS":              ("Navegação",          "#3498DB"),
-    "HTTP":             ("Transferência HTTP",  "#E74C3C"),
-    "HTTPS":            ("Conexão Segura",      "#2ECC71"),
-    "TCP_SYN":          ("Nova Conexão",        "#9B59B6"),
-    "ARP":              ("Descoberta Local",    "#E67E22"),
-    "ICMP":             ("Diagnóstico/Ping",    "#1ABC9C"),
-    "DHCP":             ("Config. de Rede",     "#16A085"),
-    "SSH":              ("Acesso Remoto",        "#2980B9"),
-    "FTP":              ("Transfer. Arquivo",   "#E91E63"),
-    "SMB":              ("Compartilhamento",    "#795548"),
-    "RDP":              ("Desktop Remoto",      "#FF5722"),
-    "NOVO_DISPOSITIVO": ("Novo Dispositivo",    "#F39C12"),
-}
-
 
 # ─────────────────────────────────────────────────────────────
 # Cartão de evento (lista lateral)
@@ -526,7 +511,7 @@ class PainelEventos(QWidget):
         """Atualiza apenas os labels da faixa superior de métricas."""
         self._lbl_resumo_eventos.setText(f"{eventos:,} eventos")
         self._lbl_resumo_dns.setText(f"{consultas_dns:,} consultas DNS")
-        self._lbl_resumo_volume.setText(f"{self._formatar_bytes(volume_bytes)} trafegados")
+        self._lbl_resumo_volume.setText(f"{formatar_bytes(volume_bytes)} trafegados")
         cor_alerta = "#E74C3C" if alertas > 0 else "#566573"
         self._lbl_resumo_alertas.setStyleSheet(
             f"color:{cor_alerta};font-size:10px;font-family:Consolas;padding:0 14px 0 0;"
@@ -608,7 +593,7 @@ class PainelEventos(QWidget):
             lbl_cnt.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             lbl_cnt.setStyleSheet("color:#2ECC71;font-size:9px;font-family:Consolas;")
 
-            lbl_vol = QLabel(self._formatar_bytes(bytes_d))
+            lbl_vol = QLabel(formatar_bytes(bytes_d))
             lbl_vol.setFixedWidth(52)
             lbl_vol.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             lbl_vol.setStyleSheet("color:#9B59B6;font-size:8px;font-family:Consolas;")
@@ -914,33 +899,6 @@ class PainelEventos(QWidget):
         """)
         t.horizontalHeader().setStretchLastSection(True)
         return t
-
-    @staticmethod
-    def _formatar_bytes(n: int) -> str:
-        if n >= 1_073_741_824:
-            return f"{n / 1_073_741_824:.2f} GB"
-        if n >= 1_048_576:
-            return f"{n / 1_048_576:.1f} MB"
-        if n >= 1_024:
-            return f"{n / 1_024:.1f} KB"
-        return f"{n} B"
-
-    @staticmethod
-    def _eh_ip_local(ip: str) -> bool:
-        try:
-            partes = [int(p) for p in ip.split(".")]
-            if len(partes) != 4:
-                return False
-            if partes[0] == 10:
-                return True
-            if partes[0] == 172 and 16 <= partes[1] <= 31:
-                return True
-            if partes[0] == 192 and partes[1] == 168:
-                return True
-        except Exception:
-            pass
-        return False
-
     # ──────────────────────────────────────────────
     # API pública — chamada pela janela principal
     # ──────────────────────────────────────────────
@@ -966,15 +924,6 @@ class PainelEventos(QWidget):
 
     def adicionar_evento(self, dados: dict):
         """Recebe um evento do motor pedagógico e exibe na interface."""
-        def _corrigir_encoding(txt: str) -> str:
-            if not isinstance(txt, str):
-                return txt
-            for enc in ("cp1252", "latin1"):
-                try:
-                    return txt.encode(enc, errors="ignore").decode("utf-8")
-                except Exception:
-                    continue
-            return txt
 
         # deque(maxlen) descarta automaticamente o mais antigo — sem pop(0)
         sessao = dados.get("sessao_id", "sessao_default")
@@ -985,7 +934,7 @@ class PainelEventos(QWidget):
         for campo in ("titulo", "nivel1", "nivel2", "nivel3", "nivel4",
                       "alerta_seguranca", "fluxo_visual"):
             if campo in dados:
-                dados[campo] = _corrigir_encoding(dados[campo])
+                dados[campo] = corrigir_mojibake(dados[campo])
 
         self._todos_eventos.append(dados)
         self.painel_contadores.incrementar(tipo)

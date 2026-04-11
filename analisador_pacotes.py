@@ -63,6 +63,8 @@ import time
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Optional
+from utils.constantes import PORTAS_HTTP, PORTAS_HTTPS, PORTAS_DHCP
+from utils.rede import eh_ip_local, _CACHE_LOCAL
 
 # ── Configuracao das filas ───────────────────────────────────
 MAXQ_ENTRADA = 8_000   # pacotes aguardando analise
@@ -75,40 +77,6 @@ _RE_HTTP_METHOD = re.compile(rb"^(GET|POST|PUT|DELETE|HEAD|OPTIONS) ")
 _RE_CREDENTIALS = re.compile(
     rb'(user|login|email|pass|password)=([^&\s]+)', re.I
 )
-
-# Portas conhecidas como frozenset para O(1) lookup
-_PORTAS_HTTP  = frozenset({80, 8080, 8000})
-_PORTAS_HTTPS = frozenset({443, 8443})
-
-# Cache de classificacao de IP local (evita re-parse de IPs repetidos)
-_CACHE_LOCAL: dict = {}
-
-
-# ── Funcoes de cache de IP ───────────────────────────────────
-
-def _calcular_eh_local(ip: str) -> bool:
-    try:
-        p = ip.split(".", 2)
-        a = int(p[0])
-        if a == 10:
-            return True
-        if a == 192:
-            return len(p) >= 2 and int(p[1]) == 168
-        if a == 172:
-            return len(p) >= 2 and 16 <= int(p[1]) <= 31
-    except Exception:
-        pass
-    return False
-
-
-def _eh_local_rapido(ip: str) -> bool:
-    cached = _CACHE_LOCAL.get(ip)
-    if cached is not None:
-        return cached
-    resultado = _calcular_eh_local(ip)
-    if len(_CACHE_LOCAL) < 8192:
-        _CACHE_LOCAL[ip] = resultado
-    return resultado
 
 
 # ════════════════════════════════════════════════════════════
@@ -252,6 +220,21 @@ def _parsear_pacote(dados: dict):
                 "protocolo":  "DNS",
             }
 
+    elif proto in ("DHCP", "UDP") and (
+        proto == "DHCP"
+        or porta_dest in PORTAS_DHCP
+        or porta_orig in PORTAS_DHCP
+    ):
+        protocolo_efetivo = "DHCP"
+        evento = {
+            "tipo":       "DHCP",
+            "ip_origem":  ip_origem,
+            "ip_destino": ip_destino,
+            "protocolo":  "DHCP",
+            "dhcp_tipo":  dados.get("dhcp_tipo", ""),
+            "dhcp_xid":   dados.get("dhcp_xid", 0),
+        }
+
     elif proto == "TCP":
         if dados.get("flags") == "SYN":
             evento = {
@@ -262,7 +245,7 @@ def _parsear_pacote(dados: dict):
                 "porta_destino": porta_dest,
                 "protocolo":     "TCP",
             }
-        elif porta_dest in _PORTAS_HTTP or porta_orig in _PORTAS_HTTP:
+        elif porta_dest in PORTAS_HTTP or porta_orig in PORTAS_HTTP:
             evento, protocolo_efetivo = _parse_http(
                 dados.get("payload", b""), ip_origem, ip_destino
             )
@@ -292,7 +275,7 @@ def _parsear_pacote(dados: dict):
                     except Exception:
                         pass
             # -------------------------------------------
-        elif porta_dest in _PORTAS_HTTPS or porta_orig in _PORTAS_HTTPS:
+        elif porta_dest in PORTAS_HTTPS or porta_orig in PORTAS_HTTPS:
             protocolo_efetivo = "HTTPS"
             evento = {
                 "tipo":       "HTTPS",
@@ -517,11 +500,11 @@ class AnalisadorPacotes:
         agregado_rec: defaultdict = defaultdict(int)
 
         for ip, v in enviado_snap.items():
-            chave = ip if _eh_local_rapido(ip) else "internet"
+            chave = ip if eh_ip_local(ip) else "internet"
             agregado_env[chave] += v
 
         for ip, v in recebido_snap.items():
-            chave = ip if _eh_local_rapido(ip) else "internet"
+            chave = ip if eh_ip_local(ip) else "internet"
             agregado_rec[chave] += v
 
         ips = set(agregado_env) | set(agregado_rec)
@@ -557,4 +540,4 @@ class AnalisadorPacotes:
 
     @staticmethod
     def _eh_local(ip: str) -> bool:
-        return _eh_local_rapido(ip)
+        return eh_ip_local(ip)

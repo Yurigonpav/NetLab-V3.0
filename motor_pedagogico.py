@@ -1,42 +1,244 @@
 ﻿# motor_pedagogico.py
-# Motor pedagÃ³gico com Deep Packet Inspection para HTTP, HTTPS, DNS, ARP, TCP, ICMP, etc.
-# Exibe explicaÃ§Ãµes em mÃºltiplos nÃ­veis (simples, tÃ©cnico, estruturado, pacote bruto)
-# com destaque de seguranÃ§a, tabelas e dump hexadecimal.
+# Motor pedagógico com Deep Packet Inspection para HTTP, HTTPS, DNS, ARP, TCP, ICMP, etc.
+# Exibe explicações em múltiplos níveis (simples, técnico, estruturado, pacote bruto)
+# com destaque de segurança, tabelas e dump hexadecimal.
 
 import urllib.parse
 import re
 from datetime import datetime
+from utils.rede import corrigir_mojibake
 
-# Palavras-chave que identificam campos sensÃ­veis em formulÃ¡rios
+# ── Campos sensíveis detectados em payloads HTTP/formulários ─────────────────
+# Cobertura máxima: auth, financeiro, PII, contato, dispositivo, saúde
 CAMPOS_SENSIVEIS = {
-    "senha", "password", "pass", "pwd", "secret", "token",
-    "auth", "key", "api_key", "apikey", "credential",
-    "credit_card", "card_number", "cvv", "cpf", "rg", "pin",
-    "ssn", "user", "usuario", "login", "email", "e-mail",
-    "username", "nome", "name", "telefone", "phone",
+    # autenticação
+    "senha", "password", "pass", "pwd", "passwd", "secret", "passphrase",
+    "pin", "otp", "totp", "mfa_code", "auth_code", "verification_code",
+    "token", "access_token", "refresh_token", "id_token", "bearer",
+    "api_key", "apikey", "api_secret", "client_secret", "app_secret",
+    "auth", "auth_token", "session_token", "session_key", "sessionid",
+    "cookie", "csrf_token", "csrfmiddlewaretoken", "xsrf_token",
+    "private_key", "secret_key", "signing_key", "encryption_key",
+    "credential", "credentials",
+
+    # identificação / login
+    "user", "usuario", "username", "login", "account", "account_id",
+    "uid", "user_id", "userid", "sub",
+
+    # PII — identificadores legais
+    "cpf", "cnpj", "rg", "rne", "passaporte", "passport", "passport_number",
+    "ssn", "sin", "nif", "nie", "dni", "pis", "nis", "nit",
+    "birth_date", "data_nascimento", "dob", "date_of_birth",
+    "mother_name", "nome_mae", "father_name",
+
+    # PII — contato / localização
+    "email", "e_mail", "e-mail", "mail",
+    "telefone", "phone", "phone_number", "cel", "celular", "mobile",
+    "fax", "whatsapp",
+    "endereco", "address", "street", "street_address",
+    "cidade", "city", "estado", "state", "pais", "country",
+    "cep", "zip", "zipcode", "postal_code",
+    "latitude", "longitude", "geo", "location",
+
+    # PII — nome / pessoal
+    "nome", "name", "full_name", "firstname", "first_name",
+    "lastname", "last_name", "sobrenome", "middle_name",
+    "gender", "sexo", "genero",
+
+    # financeiro
+    "credit_card", "card_number", "cardnumber", "pan",
+    "cvv", "cvc", "cvc2", "cvv2", "card_cvv",
+    "expiry", "expiry_date", "expiration", "exp_date", "card_exp",
+    "iban", "bic", "swift", "routing_number", "account_number",
+    "bank_account", "conta_bancaria", "agencia", "banco",
+    "pix", "chave_pix",
+    "billing_address", "billing_name",
+    "price", "preco", "valor", "amount",
+
+    # saúde
+    "cns", "sus", "health_id", "plano_saude",
+    "diagnosis", "diagnostico", "prescription", "receita",
+    "blood_type", "tipo_sanguineo",
+
+    # dispositivo / acesso técnico
+    "device_id", "device_token", "imei", "mac_address",
+    "ip_address", "hostname", "serial_number",
+    "ssh_key", "pgp_key", "certificate", "cert",
+    "webhook_secret", "deploy_key",
 }
 
-# Mapeamento OUI rÃ¡pido para identificar fabricantes (apenas exemplos comuns)
+# ── OUI → fabricante (3 bytes iniciais do MAC, uppercase sem separador) ──────
 OUI_VENDORS = {
-    "00:14:22": "Dell",
-    "00:1A:2B": "Intel",
-    "00:1B:63": "Apple",
-    "00:1E:C2": "Apple",
-    "00:25:00": "Apple",
-    "00:0C:29": "VMware",
-    "00:50:56": "VMware",
-    "00:05:69": "Cisco",
-    "00:1C:42": "Cisco",
-    "B8:27:EB": "Raspberry Pi Foundation",
-    "DC:A6:32": "Raspberry Pi",
-    "00:16:3E": "Xensource",
-    "00:15:5D": "Microsoft Hyper-V",
-    "08:00:27": "Oracle VirtualBox",
-    "00:1D:09": "Samsung",
-    "70:B3:D5": "TP-Link",
-    "94:65:2D": "Intelbras",
-    "00:11:22": "Generic",
+    # Apple
+    "001B63": "Apple", "001E52": "Apple", "001EC2": "Apple",
+    "002500": "Apple", "0017F2": "Apple", "001451": "Apple",
+    "A8BE27": "Apple", "F0DBE2": "Apple", "3C0754": "Apple",
+    "BC926B": "Apple", "E0B9BA": "Apple", "D8BB2C": "Apple",
+    "A45E60": "Apple", "F4F951": "Apple",
+
+    # Dell
+    "001422": "Dell", "0021706": "Dell", "B083FE": "Dell",
+    "848F69": "Dell", "F01FAF": "Dell", "002564": "Dell",
+
+    # Intel (NICs / wireless)
+    "001A2B": "Intel", "8086F2": "Intel", "A0369F": "Intel",
+    "003048": "Intel", "4CEB42": "Intel",
+
+    # Samsung
+    "001D09": "Samsung", "001599": "Samsung", "38ECE4": "Samsung",
+    "8CEBE1": "Samsung", "ACC327": "Samsung", "5425EA": "Samsung",
+
+    # Lenovo / IBM
+    "001A6B": "Lenovo", "40742B": "Lenovo", "5065F3": "Lenovo",
+    "483B38": "Lenovo", "54EEF7": "Lenovo",
+
+    # HP
+    "001E0B": "HP", "001560": "HP", "3C4A92": "HP",
+    "645106": "HP", "B05ADA": "HP",
+
+    # Microsoft
+    "00155D": "Microsoft Hyper-V", "7C1E52": "Microsoft",
+    "28187D": "Microsoft", "606BFF": "Microsoft",
+
+    # Google (Nest, ChromeCast, Android)
+    "F88FCA": "Google", "54607E": "Google", "6C5CE7": "Google",
+    "ACE415": "Google Nest", "1C3ADE": "Google",
+
+    # Amazon (Echo, Fire, Alexa)
+    "44650D": "Amazon Echo", "0C5765": "Amazon Fire",
+    "34D270": "Amazon", "A002DC": "Amazon", "74C246": "Amazon",
+
+    # Cisco
+    "000569": "Cisco", "001C42": "Cisco", "001D70": "Cisco",
+    "002155": "Cisco", "E4D3F1": "Cisco", "2C3124": "Cisco",
+    "70B3D5": "Cisco Meraki",
+
+    # TP-Link
+    "94D9B3": "TP-Link", "F4F26D": "TP-Link", "5CF4AB": "TP-Link",
+    "1C61B4": "TP-Link", "B0487A": "TP-Link", "EC086B": "TP-Link",
+    "C025E9": "TP-Link",
+
+    # Huawei
+    "001E10": "Huawei", "287B09": "Huawei", "4C54991": "Huawei",
+    "687B88": "Huawei", "B4CD27": "Huawei",
+
+    # Ubiquiti
+    "002722": "Ubiquiti", "0418D6": "Ubiquiti", "246895": "Ubiquiti",
+    "788A20": "Ubiquiti", "E063DA": "Ubiquiti",
+
+    # Mikrotik
+    "4C5E0C": "MikroTik", "6C3B6B": "MikroTik", "2CC8F3": "MikroTik",
+    "D4CA6D": "MikroTik",
+
+    # Netgear
+    "0014BF": "Netgear", "20E52A": "Netgear", "A021B7": "Netgear",
+    "C03F0E": "Netgear",
+
+    # D-Link
+    "001CF0": "D-Link", "1C7EE5": "D-Link", "34A84E": "D-Link",
+    "90948A": "D-Link",
+
+    # Aruba (HPE)
+    "002369": "Aruba", "9C8CD8": "Aruba", "5C5B35": "Aruba",
+
+    # Intelbras (Brasil)
+    "94652D": "Intelbras", "001C4E": "Intelbras", "7834E2": "Intelbras",
+
+    # Raspberry Pi Foundation
+    "B827EB": "Raspberry Pi", "DCA632": "Raspberry Pi",
+    "E45F01": "Raspberry Pi",
+
+    # Arduino / Espressif (ESP32 / ESP8266)
+    "BCDDC2": "Espressif", "24B2DE": "Espressif", "A84040": "Espressif",
+    "30AEA4": "Espressif", "E868E7": "Espressif",
+
+    # VMware
+    "000C29": "VMware Workstation", "005056": "VMware vSphere",
+    "000569": "VMware (alt)",
+
+    # VirtualBox (Oracle)
+    "080027": "Oracle VirtualBox",
+
+    # QEMU / KVM
+    "525400": "QEMU/KVM", "525401": "QEMU/KVM",
+
+    # Xen
+    "00163E": "Xen Hypervisor",
+
+    # Parallels
+    "001C42": "Parallels Desktop",
+
+    # Docker (bridge virtual)
+    "0242AC": "Docker Bridge",
+
+    # Genérico / fallback
+    "001122": "Generic NIC",
 }
+
+# ── Regex pré-compiladas para detecção de campos sensíveis ───────────────────
+# Usa word-boundary (\b) para evitar falsos positivos como "passage" → "pass"
+_RE_CAMPO = re.compile(
+    r'\b(' + '|'.join(re.escape(c) for c in sorted(CAMPOS_SENSIVEIS, key=len, reverse=True)) + r')\b',
+    re.IGNORECASE
+)
+
+# Normaliza separadores de MAC para lookup no OUI_VENDORS
+_RE_MAC_SEP = re.compile(r'[:\.\-\s]')
+
+
+def extrair_campos_sensiveis(campos: dict) -> list:
+    """
+    Detecta chaves sensíveis em um dicionário de campos HTTP/formulário.
+
+    Retorna lista de nomes originais (sem duplicatas) que coincidem com
+    CAMPOS_SENSIVEIS usando correspondência por palavra inteira (word-boundary),
+    insensível a maiúsculas.
+
+    Args:
+        campos: dict com nomes de campos como chaves (valores ignorados aqui).
+
+    Returns:
+        Lista de strings com os nomes originais que são sensíveis.
+    """
+    encontrados = set()
+    for chave in campos:
+        if not isinstance(chave, str):
+            continue
+        # Substitui separadores comuns por espaço para que \b funcione
+        # em variações como "user_name", "user-name", "userName"
+        chave_normalizada = re.sub(r'[_\-\s]', ' ', chave)
+        if _RE_CAMPO.search(chave_normalizada):
+            encontrados.add(chave)
+    return sorted(encontrados)
+
+
+def identificar_fabricante(mac: str) -> str:
+    """
+    Identifica o fabricante a partir dos primeiros 3 bytes (OUI) do MAC.
+
+    Aceita qualquer formato: "AA:BB:CC:DD:EE:FF", "AA-BB-CC-DD-EE-FF",
+    "AABBCC.DDEEFF", "aa bb cc dd ee ff" e variantes.
+
+    Returns:
+        Nome do fabricante ou "Desconhecido" se o OUI não for mapeado.
+    """
+    if not mac or not isinstance(mac, str):
+        return "Desconhecido"
+
+    mac_limpo = _RE_MAC_SEP.sub('', mac).upper()
+
+    # Aceita MACs de 12 hex ou 17 chars com separadores já removidos
+    if len(mac_limpo) < 6:
+        return "Desconhecido"
+
+    oui = mac_limpo[:6]
+
+    # Valida que são apenas caracteres hex
+    if not all(c in '0123456789ABCDEF' for c in oui):
+        return "Desconhecido"
+
+    return OUI_VENDORS.get(oui, "Desconhecido")
+
 
 class MotorPedagogico:
     """
@@ -95,16 +297,6 @@ class MotorPedagogico:
     def _base(self, evento: dict, icone: str, titulo: str, nivel: str,
               n1: str, n2: str, n3: str, n4: str = "",
               fluxo: str = "", alerta: str = "") -> dict:
-        def _fix_mojibake(txt: str) -> str:
-            if not isinstance(txt, str):
-                return txt
-            for enc in ("cp1252", "latin1"):
-                try:
-                    return txt.encode(enc, errors="ignore").decode("utf-8")
-                except Exception:
-                    continue
-            return txt
-
         tipo = evento.get("tipo", "")
         resultado = {
             "timestamp":        datetime.now().strftime("%H:%M:%S"),
@@ -126,7 +318,7 @@ class MotorPedagogico:
         # Corrige eventuais mojibakes antes de devolver
         for k, v in list(resultado.items()):
             if isinstance(v, str):
-                resultado[k] = _fix_mojibake(v)
+                resultado[k] = corrigir_mojibake(v)
         return resultado
 
     # ── Hook educacional HTTP (camada adicional, fail-safe) ──

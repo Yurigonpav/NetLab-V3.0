@@ -35,7 +35,7 @@ def iniciar_aplicacao():
 
     # Metadados da aplicação
     app.setApplicationName("NetLab Educacional")
-    app.setApplicationVersion("2.1")
+    app.setApplicationVersion("3.0")
     app.setOrganizationName("TCC - Técnico em Informática - Yuri Gonçalves Pavão")
 
     # Carregar folha de estilos personalizada (tema escuro) usando resource_path

@@ -15,7 +15,6 @@
 # 3. _consumir_fila() simplificado  — sem nenhuma operação pesada; despacha
 #    dados para threads especializadas e atualiza apenas o snapshot em memória.
 
-import socket
 import threading
 import time
 import ipaddress
@@ -39,6 +38,8 @@ from interface.painel_topologia import PainelTopologia
 from interface.painel_trafego import PainelTrafego
 from interface.painel_eventos import PainelEventos
 from painel_servidor import PainelServidor
+from utils.constantes import PORTAS_HTTP, PORTAS_DHCP
+from utils.rede import obter_ip_local
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -148,19 +149,6 @@ class _FilaPacotesGlobal:
 fila_pacotes_global = _FilaPacotesGlobal()
 
 
-# ════════════════════════════════════════════════════════════════════════
-# Funções auxiliares de rede
-# ════════════════════════════════════════════════════════════════════════
-
-def obter_ip_local() -> str:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            return s.getsockname()[0]
-    except Exception:
-        return "127.0.0.1"
-
-
 def obter_interfaces_disponiveis() -> list:
     try:
         from scapy.arch.windows import get_windows_if_list
@@ -199,7 +187,8 @@ class _CapturadorPacotesThread(QThread):
                 iface=self.interface,
                 prn=self._processar_pacote,
                 store=False,
-                filter="ip",
+                # Inclui ARP para contabilizar descoberta local corretamente.
+                filter="ip or arp",
                 session=TCPSession,
             )
             self.sniffer.start()
@@ -227,7 +216,7 @@ class _CapturadorPacotesThread(QThread):
             "porta_destino":None,
         }
 
-        from scapy.all import Ether, IP, TCP, UDP, ARP, DNS, Raw
+        from scapy.all import Ether, IP, TCP, UDP, ARP, DNS, Raw, BOOTP, DHCP
 
         if packet.haslayer(Ether):
             dados["mac_origem"]  = packet[Ether].src
@@ -253,7 +242,47 @@ class _CapturadorPacotesThread(QThread):
                 dados["protocolo"]     = "UDP"
                 dados["porta_origem"]  = packet[UDP].sport
                 dados["porta_destino"] = packet[UDP].dport
-                if packet.haslayer(DNS):
+                if (
+                    dados["porta_origem"] in PORTAS_DHCP
+                    or dados["porta_destino"] in PORTAS_DHCP
+                    or packet.haslayer(DHCP)
+                    or packet.haslayer(BOOTP)
+                ):
+                    dados["protocolo"] = "DHCP"
+                    dados["dhcp_tipo"] = ""
+
+                    if packet.haslayer(DHCP):
+                        opcoes = packet[DHCP].options or []
+                        mapa_tipos_dhcp = {
+                            1: "discover",
+                            2: "offer",
+                            3: "request",
+                            4: "decline",
+                            5: "ack",
+                            6: "nak",
+                            7: "release",
+                            8: "inform",
+                        }
+                        for opcao in opcoes:
+                            if (
+                                isinstance(opcao, tuple)
+                                and len(opcao) >= 2
+                                and opcao[0] == "message-type"
+                            ):
+                                valor_opcao = opcao[1]
+                                if isinstance(valor_opcao, bytes) and valor_opcao:
+                                    valor_opcao = valor_opcao[0]
+                                if isinstance(valor_opcao, int):
+                                    dados["dhcp_tipo"] = mapa_tipos_dhcp.get(
+                                        valor_opcao, str(valor_opcao)
+                                    )
+                                else:
+                                    dados["dhcp_tipo"] = str(valor_opcao)
+                                break
+                    if packet.haslayer(BOOTP):
+                        dados["dhcp_xid"] = int(getattr(packet[BOOTP], "xid", 0) or 0)
+
+                elif packet.haslayer(DNS):
                     dados["protocolo"] = "DNS"
                     if packet[DNS].qr == 0 and packet[DNS].qd:
                         dados["dominio"] = packet[DNS].qd.qname.decode(
@@ -267,10 +296,9 @@ class _CapturadorPacotesThread(QThread):
             dados["mac_origem"] = dados["mac_origem"] or packet[ARP].hwsrc
             dados["arp_op"]     = "request" if packet[ARP].op == 1 else "reply"
 
-        _HTTP_PORTS = {80, 8080, 8000}
         if packet.haslayer(Raw) and (
-            dados.get("porta_destino") in _HTTP_PORTS or
-            dados.get("porta_origem")  in _HTTP_PORTS
+            dados.get("porta_destino") in PORTAS_HTTP or
+            dados.get("porta_origem")  in PORTAS_HTTP
         ):
             dados["payload"] = packet[Raw].load
 
@@ -345,7 +373,19 @@ class _DescobrirDispositivosThread(QThread):
         self._cache_mac:       dict = {}
         self._ips_sem_mac:     set  = set()
         self._lock = threading.Lock()
-        self._param_arps = parametros or self._parametros_para_iface(interface)
+        # Quando possivel, JanelaPrincipal injeta os parametros prontos.
+        self._param_arps = dict(parametros) if parametros else {
+            "batch": self.BATCH_ARP,
+            "inter": self.INTER_ARP,
+            "sleep_lote": 0.0,
+            "pausa": self.PAUSA_RODADAS,
+            "timeout": self.TIMEOUT_ARP,
+            "tentativas": self.TENTATIVAS,
+            "limite_hosts": self.MAX_HOSTS,
+            "desativar_icmp": False,
+            "wifi": False,
+            "timer_ms": 30000,
+        }
         self._limite_hosts = self._param_arps["limite_hosts"]
         self._eh_wifi = self._param_arps.get("wifi", False)
         self._periodo_timer_ms = self._param_arps.get("timer_ms", 30000)
@@ -586,79 +626,6 @@ class _DescobrirDispositivosThread(QThread):
                 break
         return selecionados
 
-    # ── Parâmetros de varredura por tipo de interface (JanelaPrincipal) ──
-
-    def _parametros_iface_seguro(self, nome_iface: str) -> dict:
-        """
-        Replica o ajuste usado na thread de descoberta, mas disponível aqui
-        para configurar timers e flags antes de criar a thread.
-        """
-        nome_lower = (nome_iface or "").lower()
-        eh_wifi = any(p in nome_lower for p in ("wi-fi", "wifi", "wireless", "ax", "802.11"))
-
-        if eh_wifi:
-            return {
-                "batch": 8,
-                "inter": 0.0,
-                "sleep_lote": 0.25,
-                "pausa": 3.0,
-                "timeout": 2.8,
-                "tentativas": 1,
-                "limite_hosts": 128,
-                "desativar_icmp": True,
-                "wifi": True,
-                "timer_ms": 300000,  # 5 minutos, mas em Wi-Fi não iniciamos automático
-            }
-
-        return {
-            "batch": _DescobrirDispositivosThread.BATCH_ARP,
-            "inter": _DescobrirDispositivosThread.INTER_ARP,
-            "sleep_lote": 0.0,
-            "pausa": _DescobrirDispositivosThread.PAUSA_RODADAS,
-            "timeout": _DescobrirDispositivosThread.TIMEOUT_ARP,
-            "tentativas": _DescobrirDispositivosThread.TENTATIVAS,
-            "limite_hosts": _DescobrirDispositivosThread.MAX_HOSTS,
-            "desativar_icmp": False,
-            "wifi": False,
-            "timer_ms": 30000,
-        }
-
-    def _parametros_para_iface(self, nome_iface: str) -> dict:
-        """
-        Ajusta agressividade da varredura conforme tipo de interface.
-        Wi-Fi costuma derrubar conexões quando recebe bursts grandes de ARP.
-        """
-        nome_lower = (nome_iface or "").lower()
-        eh_wifi = any(p in nome_lower for p in ("wi-fi", "wifi", "wireless", "ax", "802.11"))
-
-        if eh_wifi:
-            return {
-                "batch":      8,      # bursts mínimos
-                "inter":      0.0,    # srp já vai com poucos pacotes; inter 0
-                "sleep_lote": 0.25,   # 250 ms entre lotes
-                "pausa":      3.0,    # espaçamento maior entre rodadas
-                "timeout":    2.8,    # tolerância extra para Wi‑Fi
-                "tentativas": 1,      # 1 rodada ativa
-                "limite_hosts": 128,  # não varrer blocos grandes via Wi‑Fi
-                "desativar_icmp": True,  # ICMP ativo desligado em Wi‑Fi
-                "wifi": True,
-                "timer_ms": 300000,   # varredura periódica a cada 5 min (lenta)
-            }
-
-        # padrão cabeado
-        return {
-            "batch":      self.BATCH_ARP,
-            "inter":      self.INTER_ARP,
-            "sleep_lote": 0.0,
-            "pausa":      self.PAUSA_RODADAS,
-            "timeout":    self.TIMEOUT_ARP,
-            "tentativas": self.TENTATIVAS,
-            "limite_hosts": self.MAX_HOSTS,
-            "desativar_icmp": False,
-            "wifi": False,
-            "timer_ms": 30000,
-        }
-
     # ── Registro thread-safe ──────────────────────────────────────────
 
     def _registrar(self, ip: str, mac: str, hostname: str):
@@ -756,38 +723,6 @@ class _WorkerRunnable(QRunnable):
             _sinal_pedagogico_global.resultado.emit(explicacao)
         except Exception as e:
             print(f"[Worker pedagógico] Erro: {e}")
-
-
-# ════════════════════════════════════════════════════════════════════════
-# Worker legado — mantido apenas para compatibilidade interna
-# ════════════════════════════════════════════════════════════════════════
-
-class WorkerPedagogico(QObject):
-    resultado_pronto = pyqtSignal(dict)
-    finished = pyqtSignal()
-
-    def __init__(self, evento, motor):
-        super().__init__()
-        self.evento = evento
-        self.motor = motor
-
-    def run(self):
-        try:
-            explicacao = self.motor.gerar_explicacao(self.evento)
-            if explicacao is None:
-                explicacao = {
-                    "nivel1": f"Evento: {self.evento.get('tipo', 'Desconhecido')}",
-                    "nivel2": f"Origem: {self.evento.get('ip_origem', '?')} → Destino: {self.evento.get('ip_destino', '?')}",
-                    "nivel3": f"Dados: {self.evento}",
-                    "icone": "🔍", "nivel": "INFO",
-                    "alerta": "Evento detectado.",
-                }
-            explicacao["sessao_id"] = self.evento.get("sessao_id")
-            self.resultado_pronto.emit(explicacao)
-        except Exception as e:
-            print(f"Erro no worker pedagógico: {e}")
-        finally:
-            self.finished.emit()
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1047,41 +982,6 @@ class JanelaPrincipal(QMainWindow):
             return ""
         prefixo = self._mascara_para_prefixo(mask) if mask else 24
         return f"{ip}/{prefixo}"
-
-    def _parametros_iface_seguro(self, nome_iface: str) -> dict:
-        """
-        Limites conservadores para Wi‑Fi e padrão para cabeada.
-        Usado antes de iniciar captura e ao instanciar a thread de descoberta.
-        """
-        nome_lower = (nome_iface or "").lower()
-        eh_wifi = any(p in nome_lower for p in ("wi-fi", "wifi", "wireless", "ax", "802.11"))
-
-        if eh_wifi:
-            return {
-                "batch": 8,
-                "inter": 0.0,
-                "sleep_lote": 0.25,
-                "pausa": 3.0,
-                "timeout": 2.8,
-                "tentativas": 1,
-                "limite_hosts": 128,
-                "desativar_icmp": True,
-                "wifi": True,
-                "timer_ms": 600000,  # 10 minutos
-            }
-
-        return {
-            "batch": _DescobrirDispositivosThread.BATCH_ARP,
-            "inter": _DescobrirDispositivosThread.INTER_ARP,
-            "sleep_lote": 0.0,
-            "pausa": _DescobrirDispositivosThread.PAUSA_RODADAS,
-            "timeout": _DescobrirDispositivosThread.TIMEOUT_ARP,
-            "tentativas": _DescobrirDispositivosThread.TENTATIVAS,
-            "limite_hosts": _DescobrirDispositivosThread.MAX_HOSTS,
-            "desativar_icmp": False,
-            "wifi": False,
-            "timer_ms": 30000,
-        }
 
     def _parametros_iface_seguro(self, nome_iface: str) -> dict:
         """
@@ -1353,10 +1253,15 @@ class JanelaPrincipal(QMainWindow):
                     )
                     chave = f"{tipo}_{ip_origem}_{_disc}"
                     
+                    # HTTP/HTTPS: manter todos os eventos para compatibilizar
+                    # com o volume real visto no servidor (sem dedupe por cooldown).
+                    if tipo in ("HTTP", "HTTPS"):
+                        self.fila_eventos_ui.append(evento)
+
                     # DNS: cooldown por domínio (3s) — evita flood de eventos
                     # na UI sem perder consultas a domínios distintos.
                     # Antes: sem cooldown → centenas de eventos/min em redes ativas.
-                    if tipo == "DNS":
+                    elif tipo == "DNS":
                         dominio = evento.get("dominio", "")
                         chave_dns = f"DNS_{ip_origem}_{dominio}"
                         if self.estado_rede.deve_emitir_evento(chave_dns, cooldown=3):
@@ -1399,13 +1304,28 @@ class JanelaPrincipal(QMainWindow):
 
     def _agregar_eventos(self, eventos: list) -> list:
         agregados: dict = {}
+        resultado: list = []
         for ev in eventos:
-            chave = (ev.get("tipo"), ev.get("ip_origem"), ev.get("dominio", ""))
+            # HTTP/HTTPS não são agregados: cada requisição deve aparecer.
+            if ev.get("tipo") in ("HTTP", "HTTPS"):
+                resultado.append(ev)
+                continue
+
+            chave = (
+                ev.get("tipo"),
+                ev.get("ip_origem"),
+                ev.get("ip_destino"),
+                ev.get("dominio", ""),
+                ev.get("metodo", ""),
+                ev.get("recurso", ""),
+            )
             if chave not in agregados:
-                agregados[chave] = {**ev, "contagem": 1}
+                item = {**ev, "contagem": 1}
+                agregados[chave] = item
+                resultado.append(item)
             else:
                 agregados[chave]["contagem"] += 1
-        return list(agregados.values())
+        return resultado
 
     @pyqtSlot()
     def _descarregar_eventos_ui(self):
@@ -1414,6 +1334,11 @@ class JanelaPrincipal(QMainWindow):
         lote = list(self.fila_eventos_ui)
         self.fila_eventos_ui.clear()
         for ev in self._agregar_eventos(lote):
+            tipo = ev.get("tipo", "")
+            if tipo in ("HTTP", "HTTPS"):
+                self._exibir_evento_pedagogico(ev)
+                continue
+
             _disc_visual = (
                 ev.get("dominio", "")
                 or f"{ev.get('metodo', '')}:{ev.get('recurso', '')}"
@@ -1585,13 +1510,17 @@ class JanelaPrincipal(QMainWindow):
 
     def _exibir_sobre(self):
         QMessageBox.about(
-            self, "Sobre o NetLab Educacional",
-            "<h2>NetLab Educacional v2.1</h2>"
-            "<p>Software educacional para análise de redes locais.</p>"
-            "<hr>"
-            "<p><b>TCC — Curso Técnico em Informática</b></p>"
-            "<p><b>Tecnologias:</b> Python · PyQt6 · Scapy · SQLite · PyQtGraph</p>"
-        )
+        self,
+        "Sobre o NetLab Educacional",
+        "<h2>NetLab Educacional V3.0</h2>"
+        "<p>Plataforma educacional para análise de redes locais com captura de pacotes em tempo real e explicações didáticas automatizadas.</p>"
+        "<hr>"
+        "<p><b>TCC — Curso Técnico em Informática</b></p>"
+        "<p><b>Tecnologias:</b> Python · PyQt6 · Scapy · SQLite · PyQtGraph</p>"
+        "<p><b>Destaques:</b> DPI, detecção de dados sensíveis, identificação via MAC/OUI e monitoramento em tempo real.</p>"
+        "<p><b>Autor:</b> Yuri Gonçalves Pavão</p>"
+        "<p><b>Instagram:</b> @yuri_g0n | <b>GitHub:</b> github.com/yurigonp</p>"
+    )
 
     def closeEvent(self, evento):
         self._finalizar_workers()

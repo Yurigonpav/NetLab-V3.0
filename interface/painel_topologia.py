@@ -10,7 +10,6 @@
 #   - Múltiplos anéis concêntricos para evitar sobreposição
 
 import math
-import socket
 from typing import Dict, Optional, Tuple
 from collections import defaultdict
 
@@ -23,48 +22,10 @@ from PyQt6.QtGui import (
     QPainter, QPen, QBrush, QColor, QFont,
     QRadialGradient, QCursor, QPainterPath, QFontMetrics
 )
+from utils.rede import obter_ip_local, eh_ip_local, eh_endereco_valido
 
 
 # ── Helpers de endereço ───────────────────────────────────────────────────────
-
-def _eh_ip_local(ip: str) -> bool:
-    try:
-        p = [int(x) for x in ip.split(".")]
-        if len(p) != 4:
-            return False
-        if p[0] == 10:
-            return True
-        if p[0] == 172 and 16 <= p[1] <= 31:
-            return True
-        if p[0] == 192 and p[1] == 168:
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def _eh_endereco_valido(ip: str) -> bool:
-    if not ip:
-        return False
-    try:
-        p = [int(x) for x in ip.split(".")]
-        if len(p) != 4:
-            return False
-        if p[3] == 255:
-            return False
-        if ip == "255.255.255.255":
-            return False
-        if p[0] == 127:
-            return False
-        if 224 <= p[0] <= 239:
-            return False
-        if p[0] == 169 and p[1] == 254:
-            return False
-        if p[0] == 0:
-            return False
-    except Exception:
-        return False
-    return True
 
 
 # ── Painel de detalhes do dispositivo ────────────────────────────────────────
@@ -211,7 +172,7 @@ class VisualizadorTopologia(QWidget):
         self.dispositivos: Dict[str, dict]        = {}
         self.contagem_conexoes: Dict[Tuple, int]  = defaultdict(int)
         self._posicoes_mundo: Dict[str, QPointF]  = {}
-        self._ip_local = self._obter_ip_local()
+        self._ip_local = obter_ip_local()
         self._rede_local = None  # ipaddress.ip_network
 
         self._zoom       = 1.0
@@ -246,7 +207,7 @@ class VisualizadorTopologia(QWidget):
     # ── Interface publica ──────────────────────────────────────────────────
 
     def registrar_origem(self, ip: str, mac: str = "", hostname: str = ""):
-        if not _eh_endereco_valido(ip):
+        if not eh_endereco_valido(ip):
             return
         chave = ip if self._pertence_rede(ip) else "internet"
 
@@ -272,7 +233,7 @@ class VisualizadorTopologia(QWidget):
 
     def registrar_conexao(self, ip_origem: str, ip_destino: str,
                           porta_origem: int = 0, porta_destino: int = 0):
-        if not _eh_endereco_valido(ip_origem) or not _eh_endereco_valido(ip_destino):
+        if not eh_endereco_valido(ip_origem) or not eh_endereco_valido(ip_destino):
             return
         no_a = ip_origem  if self._pertence_rede(ip_origem)  else "internet"
         no_b = ip_destino if self._pertence_rede(ip_destino) else "internet"
@@ -362,15 +323,15 @@ class VisualizadorTopologia(QWidget):
             self._rede_local = None
 
     def _pertence_rede(self, ip: str) -> bool:
-        if not ip or not _eh_endereco_valido(ip):
+        if not ip or not eh_endereco_valido(ip):
             return False
         if self._rede_local is None:
-            return _eh_ip_local(ip)
+            return eh_ip_local(ip)
         try:
             import ipaddress
             return ipaddress.ip_address(ip) in self._rede_local
         except Exception:
-            return _eh_ip_local(ip)
+            return eh_ip_local(ip)
 
     # ── Desenho ────────────────────────────────────────────────────────────
 
@@ -745,14 +706,6 @@ class VisualizadorTopologia(QWidget):
         self._auto_zoom()
         super().resizeEvent(evento)
 
-    @staticmethod
-    def _obter_ip_local() -> str:
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-                s.connect(("8.8.8.8", 80))
-                return s.getsockname()[0]
-        except Exception:
-            return ""
 
 
 # ── Painel contentor ──────────────────────────────────────────────────────────

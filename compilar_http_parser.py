@@ -1,94 +1,32 @@
 #!/usr/bin/env python3
 """
-compilar_http_parser.py
-=======================
-Detecta o compilador disponível (MinGW gcc ou MSVC cl.exe) e compila
-http_parser.c → http_parser.dll  (Windows)
-              → http_parser.so   (Linux/macOS)
+Wrapper de compatibilidade para compilacao do http_parser.
 
-Uso:
-    python compilar_http_parser.py
-
-Coloque http_parser.c e este script na RAIZ do projeto NetLab,
-ao lado de analisador_pacotes.py.
+Uso recomendado:
+    python utils/compilar_c.py
 """
 
-import subprocess
+from __future__ import annotations
+
 import sys
-import shutil
-import platform
-from pathlib import Path
 
-SRC  = Path(__file__).parent / "http_parser.c"
-OUT_WIN   = Path(__file__).parent / "http_parser.dll"
-OUT_POSIX = Path(__file__).parent / "http_parser.so"
+from utils.compilar_c import MODULOS_C, compilar
 
 
-def compilar_mingw():
-    out = OUT_WIN
-    cmd = ["gcc", "-O2", "-shared", "-o", str(out), str(SRC)]
-    print(f"[gcc]  {' '.join(cmd)}")
-    resultado = subprocess.run(cmd, capture_output=True, text=True)
-    if resultado.returncode != 0:
-        print("ERRO gcc:\n", resultado.stderr)
-        return False
-    print(f"OK → {out}")
-    return True
+def main() -> int:
+    modulo_http = next((m for m in MODULOS_C if m["fonte"].name == "http_parser.c"), None)
+    if not modulo_http:
+        print("[ERRO] Modulo http_parser.c nao encontrado na lista de compilacao.")
+        return 1
 
+    if compilar(modulo_http):
+        print("\nCompilacao concluida. Reinicie o NetLab para usar o parser C.")
+        return 0
 
-def compilar_msvc():
-    out = OUT_WIN
-    cmd = ["cl", "/O2", "/LD", str(SRC), f"/Fe:{out}",
-           "/nologo", "/W3"]
-    print(f"[cl]   {' '.join(cmd)}")
-    resultado = subprocess.run(cmd, capture_output=True, text=True)
-    if resultado.returncode != 0:
-        print("ERRO cl:\n", resultado.stderr)
-        return False
-    print(f"OK → {out}")
-    return True
-
-
-def compilar_posix():
-    out = OUT_POSIX
-    cmd = ["gcc", "-O2", "-shared", "-fPIC", "-o", str(out), str(SRC)]
-    print(f"[gcc]  {' '.join(cmd)}")
-    resultado = subprocess.run(cmd, capture_output=True, text=True)
-    if resultado.returncode != 0:
-        print("ERRO gcc:\n", resultado.stderr)
-        return False
-    print(f"OK → {out}")
-    return True
-
-
-def main():
-    if not SRC.exists():
-        print(f"ERRO: {SRC} não encontrado. Coloque http_parser.c na raiz do projeto.")
-        sys.exit(1)
-
-    sistema = platform.system()
-
-    if sistema == "Windows":
-        if shutil.which("gcc"):
-            ok = compilar_mingw()
-        elif shutil.which("cl"):
-            ok = compilar_msvc()
-        else:
-            print(
-                "ERRO: Nenhum compilador C encontrado.\n"
-                "Instale MinGW (https://winlibs.com/) e adicione ao PATH,\n"
-                "ou instale Visual Studio Build Tools."
-            )
-            sys.exit(1)
-    else:
-        ok = compilar_posix()
-
-    if ok:
-        print("\nCompilação concluída. Reinicie o NetLab para usar o parser C.")
-    else:
-        print("\nFalha na compilação. O NetLab usará o parser Python como fallback.")
-        sys.exit(1)
+    print("\nFalha na compilacao. O NetLab seguira com fallback em Python.")
+    return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
+

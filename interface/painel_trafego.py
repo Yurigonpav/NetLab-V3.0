@@ -11,20 +11,14 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QColor
+from utils.constantes import CORES_PROTOCOLO
+from utils.rede import formatar_bytes
 
 try:
     import pyqtgraph as pg
     PYQTGRAPH_DISPONIVEL = True
 except ImportError:
     PYQTGRAPH_DISPONIVEL = False
-
-CORES_PROTOCOLOS = {
-    "HTTP": "#E74C3C", "HTTPS": "#2ECC71", "DNS":  "#3498DB",
-    "TCP":  "#9B59B6", "UDP":   "#F39C12", "ICMP": "#1ABC9C",
-    "ARP":  "#E67E22", "SSH":   "#2980B9", "FTP":  "#E91E63",
-    "SMB":  "#795548", "RDP":   "#FF5722", "DHCP": "#16A085",
-    "Outro":"#7f8c8d",
-}
 
 JANELA_GRAFICO = 60   # segundos exibidos no gráfico
 
@@ -212,10 +206,7 @@ class PainelTrafego(QWidget):
 
         # Cards
         self.card_pacotes.definir_valor(f"{total_pacotes:,}")
-        kb = total_bytes / 1024
-        self.card_dados.definir_valor(
-            f"{kb/1024:.2f} MB" if kb > 1024 else f"{kb:.1f} KB"
-        )
+        self.card_dados.definir_valor(formatar_bytes(total_bytes))
 
         ativos = total_ativos if total_ativos is not None else len(top_dispositivos)
         self.card_dispositivos.definir_valor(str(ativos))
@@ -230,7 +221,7 @@ class PainelTrafego(QWidget):
         self.tabela_protocolos.setRowCount(len(estatisticas_protocolos))
         for i, stat in enumerate(estatisticas_protocolos):
             proto = stat["protocolo"]
-            cor   = QColor(CORES_PROTOCOLOS.get(proto, "#95a5a6"))
+            cor   = QColor(CORES_PROTOCOLO.get(proto, "#95a5a6"))
 
             item_p = QTableWidgetItem(proto)
             item_p.setForeground(cor)
