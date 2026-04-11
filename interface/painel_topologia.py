@@ -227,14 +227,21 @@ class VisualizadorTopologia(QWidget):
         self._fase_animacao = 0
         timer = QTimer(self)
         timer.timeout.connect(self._passo_animacao)
-        # Reduzido de 40ms (25fps) para 100ms (10fps).
-        # 10fps é perfeitamente fluido para animação de pulso do nó local
-        # e economiza ~60% do CPU gasto em redraws desnecessários.
-        timer.start(100)
+        # 33ms ≈ 30fps — animação fluida, ainda leve para a CPU.
+        timer.start(33)
+
+        # Debounce do recalculo de layout — chama no máximo 1x a cada 800ms,
+        # independentemente de quantos novos IPs chegarem nesse intervalo.
+        self._timer_layout = QTimer(self)
+        self._timer_layout.setSingleShot(True)
+        self._timer_layout.setInterval(800)
+        self._timer_layout.timeout.connect(self._recalcular_layout)
 
         self.setMouseTracking(True)
         self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
         self.setMinimumSize(500, 350)
+        # Evita repintura do fundo pelo Qt antes do nosso draw → menos overdraw.
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
 
     # ── Interface publica ──────────────────────────────────────────────────
 
@@ -251,7 +258,10 @@ class VisualizadorTopologia(QWidget):
                 "pacotes":  0,
                 "portas":   set(),
             }
-            self._recalcular_layout()
+            # Agenda recalculo de layout com debounce — evita chamar
+            # _recalcular_layout centenas de vezes por segundo em capturas pesadas.
+            if not self._timer_layout.isActive():
+                self._timer_layout.start()
         else:
             if mac and chave != "internet":
                 self.dispositivos[chave]["mac"] = mac

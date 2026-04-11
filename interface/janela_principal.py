@@ -18,7 +18,9 @@
 import socket
 import threading
 import time
+import ipaddress
 from collections import deque
+from typing import Optional
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout,
@@ -282,128 +284,419 @@ class _CapturadorPacotesThread(QThread):
 
 
 # ════════════════════════════════════════════════════════════════════════
-# Thread de varredura ARP
-# ════════════════════════════════════════════════════════════════════════
-
+# _DescobrirDispositivosThread — versão aprimorada para redes institucionais
+#
+# MELHORIAS EM RELAÇÃO À VERSÃO ANTERIOR:
+#
+#   1. ARP com 3 tentativas (retry) — pacotes perdidos por switches com
+#      STP/port-security são recuperados nas retransmissões.
+#
+#   2. ICMP paralelo real — ping em lote com sr() cobrindo hosts que
+#      eventualmente bloqueiam ARP; mantém timeout curto e paralelismo.
+#
+#   3. Detecção de múltiplas sub-redes — se a instituição usa /22 ou /23,
+#      o varredor expande automaticamente o escopo de busca.
+#
+#   4. Envio ARP manual em broadcast — contorna filtros de switches que
+#      bloqueiam a implementação padrão do arping() do Scapy.
+#
+#   5. Descoberta passiva aprimorada — aproveita IPs já vistos na captura
 class _DescobrirDispositivosThread(QThread):
+    """
+    Descoberta de hosts via ARP sweep massivo com múltiplas rodadas.
+
+    Estratégia:
+      Rodada 1-3 — srp() com ARP individual para cada IP da sub-rede,
+                   em lotes de 256. Cada rodada cobre apenas os hosts
+                   que ainda não responderam — eficiente em redes com
+                   port-security ou switches gerenciados que filtram
+                   broadcasts tradicionais do arping().
+
+    Por que não usar arping() ou ICMP?
+      • arping() envia 1 broadcast para a sub-rede toda; switches com
+        STP/VLAN isolation podem não repassá-lo a todos os hosts.
+      • ICMP via Ethernet exige ARP prévio para resolver o MAC de destino;
+        sem isso o pacote vai para broadcast e a maioria dos hosts ignora.
+      • srp() com ARP individual por host: cada switch precisa apenas
+        encaminhar para a porta correta — nenhum flooding necessário.
+    """
+
     dispositivo_encontrado = pyqtSignal(str, str, str)
     varredura_concluida    = pyqtSignal(list)
     progresso_atualizado   = pyqtSignal(str)
     erro_ocorrido          = pyqtSignal(str)
 
-    def __init__(self, interface: str, cidr: str = "", habilitar_ping: bool = True):
+    TIMEOUT_ARP    = 1.8   # timeout padrão ARP (ajustado dinamicamente)
+    TIMEOUT_ICMP   = 1.0   # timeout enxuto para ping paralelo
+    TENTATIVAS     = 3     # rodadas de retry para hosts que não responderam
+    BATCH_ARP      = 512   # padrão cablado; em Wi‑Fi reduzimos
+    MAX_HOSTS      = 4_096 # teto de IPs varridos distribuídos em toda a sub-rede
+    PAUSA_RODADAS  = 0.6   # segundos entre rodadas (dinâmico em Wi‑Fi)
+    WORKERS_ICMP   = 64    # reservado (ICMP L2 já usa cache de MAC)
+    INTER_ARP      = 0.0   # intervalo entre quadros ARP (Wi‑Fi ajusta para >0)
+
+    def __init__(self, interface: str, cidr: str = "", habilitar_ping: bool = True,
+                 parametros: dict = None):
         super().__init__()
-        self.interface     = interface
-        self.cidr          = cidr
-        self.habilitar_ping = habilitar_ping
+        self.interface   = interface
+        self.cidr        = cidr
+        self._ips_encontrados: set  = set()
+        self._dispositivos:    list = []
+        self._cache_mac:       dict = {}
+        self._ips_sem_mac:     set  = set()
+        self._lock = threading.Lock()
+        self._param_arps = parametros or self._parametros_para_iface(interface)
+        self._limite_hosts = self._param_arps["limite_hosts"]
+        self._eh_wifi = self._param_arps.get("wifi", False)
+        self._periodo_timer_ms = self._param_arps.get("timer_ms", 30000)
+
+    # ── Ponto de entrada ─────────────────────────────────────────────
 
     def run(self):
         try:
-            rede = self.cidr or self._cidr_por_interface() or self._cidr_por_ip_local()
-            if not rede:
-                self.erro_ocorrido.emit("Não foi possível determinar a sub-rede.")
+            rede_cidr = self.cidr or self._detectar_cidr() or self._cidr_por_ip_local()
+            if not rede_cidr:
+                self.erro_ocorrido.emit(
+                    "Não foi possível determinar a sub-rede. "
+                    "Verifique se a interface está ativa."
+                )
                 return
 
-            self.progresso_atualizado.emit(f"Varredura ARP ({rede}) — fase 1/2...")
+            self.progresso_atualizado.emit(f"Iniciando varredura em {rede_cidr} …")
+            self._varrer_arp(rede_cidr)
+            self._varrer_icmp(rede_cidr)
 
-            from scapy.all import arping
-            import ipaddress
-
-            # ── FASE 1: ARP broadcast com timeout estendido ──────────────
-            # timeout=2 era insuficiente em redes corporativas com >100 hosts
-            # ou switches com STP/port security. Aumentado para 4s.
-            resultado = arping(rede, iface=self.interface, timeout=4, verbose=False)
-
-            dispositivos = []
-            vistos: set = set()
-            ips_vistos: set = set()
-            for _, received in resultado[0]:
-                ip, mac = received.psrc, received.hwsrc
-                if not self._ip_util(ip) or (ip, mac) in vistos:
-                    continue
-                vistos.add((ip, mac))
-                ips_vistos.add(ip)
-                dispositivos.append((ip, mac, ""))
-                self.dispositivo_encontrado.emit(ip, mac, "")
-
-            # ── FASE 2: ICMP sweep para hosts que bloqueiam ARP ──────────
-            # VMs, firewalls e hosts com ARP filtering não respondem ARP
-            # mas respondem ICMP Echo. Esta fase cobre essa lacuna.
-            if self.habilitar_ping:
+            # Expansão só em cabeada; em Wi‑Fi evita flood.
+            if not self._eh_wifi:
                 try:
-                    rede_obj = ipaddress.ip_network(rede, strict=False)
-                    hosts_todos = [str(h) for h in list(rede_obj.hosts())[:254]]
-                    hosts_pendentes = [h for h in hosts_todos if h not in ips_vistos]
-
-                    self.progresso_atualizado.emit(
-                        f"Fase 2/2: ICMP sweep em {len(hosts_pendentes)} host(s) restante(s)..."
-                    )
-
-                    from scapy.all import srp, Ether, IP, ICMP
-
-                    # Processa em lotes de 32 para controlar uso de memória
-                    # e evitar flood que trigger port-security em switches
-                    LOTE = 32
-                    for i in range(0, len(hosts_pendentes), LOTE):
-                        lote = hosts_pendentes[i:i + LOTE]
-                        pacotes = [
-                            Ether(dst="ff:ff:ff:ff:ff:ff") / IP(dst=h) / ICMP()
-                            for h in lote
-                        ]
-                        try:
-                            respostas, _ = srp(
-                                pacotes,
-                                iface=self.interface,
-                                timeout=1,
-                                verbose=False,
+                    rede_obj = ipaddress.ip_network(rede_cidr, strict=False)
+                    if rede_obj.prefixlen >= 24 and len(self._ips_encontrados) < 30:
+                        novo_prefixo = max(22, rede_obj.prefixlen - 2)
+                        rede_expandida = str(rede_obj.supernet(new_prefix=novo_prefixo))
+                        if rede_expandida != rede_cidr:
+                            self.progresso_atualizado.emit(
+                                f"Poucas respostas em {rede_cidr}. "
+                                f"Expandindo para {rede_expandida} …"
                             )
-                            for _, r in respostas:
-                                if not r.haslayer(IP):
-                                    continue
-                                ip  = r[IP].src
-                                mac = r[Ether].src if r.haslayer(Ether) else ""
-                                if self._ip_util(ip) and ip not in ips_vistos:
-                                    ips_vistos.add(ip)
-                                    dispositivos.append((ip, mac, ""))
-                                    self.dispositivo_encontrado.emit(ip, mac, "")
-                        except Exception:
-                            pass  # lote individual falhou — continua os demais
-                except Exception as e:
-                    self.progresso_atualizado.emit(f"ICMP sweep parcialmente falhou: {e}")
+                            self._varrer_arp(rede_expandida)
+                            self._varrer_icmp(rede_expandida)
+                except Exception:
+                    pass
+
+            total = len(self._dispositivos)
+            self.progresso_atualizado.emit(
+                f"Varredura concluída — {total} dispositivo(s) encontrado(s)."
+            )
+            self.varredura_concluida.emit(self._dispositivos)
+
+        except Exception as erro:
+            self.erro_ocorrido.emit(f"Erro na descoberta: {erro}")
+
+    # ── ARP sweep com lotes individuais ──────────────────────────────
+
+    def _varrer_arp(self, rede_cidr: str):
+        """
+        Envia ARP Request individual para cada IP da sub-rede usando srp().
+        Hosts que não responderem na rodada 1 são retentados nas próximas,
+        até TENTATIVAS vezes — cobre switchs lentos e hosts sob carga.
+        """
+        from scapy.all import ARP, Ether, srp
+
+        try:
+            rede  = ipaddress.ip_network(rede_cidr, strict=False)
+            todos = self._selecionar_hosts(rede)
+        except Exception as e:
+            self.progresso_atualizado.emit(f"Erro ao listar hosts de {rede_cidr}: {e}")
+            return
+
+        batch      = self._param_arps["batch"]
+        inter_pkt  = self._param_arps["inter"]
+        pausa      = self._param_arps["pausa"]
+        timeout    = self._param_arps["timeout"]
+        sleep_lote = self._param_arps.get("sleep_lote", 0.0)
+        tentativas = self._param_arps["tentativas"] if len(todos) <= 1024 else max(2, self._param_arps["tentativas"] - 1)
+
+        self.progresso_atualizado.emit(
+            f"ARP sweep: {len(todos)} IPs · {tentativas} rodada(s) · "
+            f"lotes de {batch} (inter={inter_pkt*1000:.0f}ms)…"
+        )
+
+        for rodada in range(1, tentativas + 1):
+            # Apenas os hosts que ainda não responderam
+            pendentes = [h for h in todos if h not in self._ips_encontrados]
+            if not pendentes:
+                self.progresso_atualizado.emit(
+                    f"Todos os hosts responderam após {rodada - 1} rodada(s)."
+                )
+                break
 
             self.progresso_atualizado.emit(
-                f"Varredura concluída: {len(dispositivos)} dispositivo(s) encontrado(s)."
+                f"Rodada ARP {rodada}/{tentativas}: "
+                f"{len(pendentes)} host(s) pendente(s) …"
             )
-            self.varredura_concluida.emit(dispositivos)
 
+            encontrados_nesta_rodada = 0
+
+            for inicio in range(0, len(pendentes), batch):
+                lote = pendentes[inicio : inicio + batch]
+                pacotes_arp = [
+                    Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip)
+                    for ip in lote
+                ]
+                try:
+                    respostas, _ = srp(
+                        pacotes_arp,
+                        iface=self.interface,
+                        timeout=timeout,
+                        verbose=False,
+                        retry=0,
+                        inter=inter_pkt,
+                    )
+                    for _, resp in respostas:
+                        try:
+                            ip_resp  = resp[ARP].psrc
+                            mac_resp = resp[ARP].hwsrc
+                            if self._ip_valido(ip_resp):
+                                self._registrar(ip_resp, mac_resp, "")
+                                encontrados_nesta_rodada += 1
+                        except Exception:
+                            pass
+                except Exception as e:
+                    self.progresso_atualizado.emit(
+                        f"Lote {inicio//batch + 1} falhou: {e}"
+                    )
+
+                if sleep_lote > 0:
+                    time.sleep(sleep_lote)
+
+            self.progresso_atualizado.emit(
+                f"Rodada {rodada}: +{encontrados_nesta_rodada} novo(s) · "
+                f"total {len(self._ips_encontrados)}"
+            )
+
+            if rodada < tentativas and encontrados_nesta_rodada == 0:
+                break
+
+            if rodada < tentativas:
+                time.sleep(pausa)
+
+    def _varrer_icmp(self, rede_cidr: str):
+        """
+        Ping paralelo em nível 2 (Ether/IP/ICMP) somente para hosts com MAC já
+        resolvido. Evita ARP implícito do sr() e elimina broadcasts extras.
+        """
+        from scapy.all import IP, ICMP, Ether, srp
+
+        if self._param_arps.get("desativar_icmp", False):
+            return
+
+        try:
+            rede = ipaddress.ip_network(rede_cidr, strict=False)
+            todos = self._selecionar_hosts(rede)
         except Exception as e:
-            self.erro_ocorrido.emit(f"Erro na descoberta: {e}")
+            self.progresso_atualizado.emit(f"ICMP abortado: {e}")
+            return
+
+        pendentes = [ip for ip in todos if ip not in self._ips_encontrados]
+        if not pendentes:
+            return
+
+        candidatos = []
+        for ip in pendentes:
+            if ip in self._ips_sem_mac:
+                continue
+            mac = self._cache_mac.get(ip)
+            if not mac:
+                mac = self._resolver_mac_unico(ip)
+            if mac:
+                candidatos.append(ip)
+            else:
+                # Evita repetir broadcast infinito em hosts que ignoram ARP
+                self._ips_sem_mac.add(ip)
+
+        if not candidatos:
+            self.progresso_atualizado.emit("ICMP: nenhum host restante com MAC resolvido.")
+            return
+
+        self.progresso_atualizado.emit(
+            f"ICMP paralelo (L2): {len(candidatos)} host(s) com MAC resolvido …"
+        )
+
+        pacotes = [
+            Ether(dst=self._cache_mac.get(ip, "ff:ff:ff:ff:ff:ff")) / IP(dst=ip) / ICMP()
+            for ip in candidatos
+        ]
+
+        try:
+            respostas, _ = srp(
+                pacotes,
+                iface=self.interface,
+                timeout=self.TIMEOUT_ICMP,
+                retry=0,
+                verbose=False,
+                inter=0,
+            )
+            for _, resp in respostas:
+                try:
+                    ip_resp  = resp[IP].src if resp.haslayer(IP) else ""
+                    mac_resp = resp[Ether].src if resp.haslayer(Ether) else ""
+                    if self._ip_valido(ip_resp):
+                        self._registrar(ip_resp, mac_resp, "")
+                except Exception:
+                    pass
+        except Exception as e:
+            self.progresso_atualizado.emit(f"ICMP falhou: {e}")
+
+    def _resolver_mac_unico(self, ip: str) -> str:
+        """Tenta resolver MAC de um host específico sem inundar a rede."""
+        from scapy.all import ARP, Ether, srp1
+        try:
+            resposta = srp1(
+                Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=ip),
+                iface=self.interface,
+                timeout=0.6,
+                retry=0,
+                verbose=False,
+            )
+            if resposta and resposta.haslayer(ARP):
+                return resposta[ARP].hwsrc
+        except Exception:
+            pass
+        return ""
+
+    def _selecionar_hosts(self, rede: ipaddress.IPv4Network) -> list:
+        """
+        Seleciona até MAX_HOSTS endereços distribuídos uniformemente
+        pela rede inteira, evitando o viés de apenas varrer o início
+        do bloco em sub-redes grandes (/16, /20, etc.).
+        """
+        total_hosts = max(0, rede.num_addresses - 2)
+        if total_hosts <= 0:
+            return []
+        limite = self._limite_hosts
+        if total_hosts <= limite:
+            return [str(h) for h in rede.hosts()]
+
+        passo = max(1, total_hosts // limite)
+        selecionados = []
+        for idx, host in enumerate(rede.hosts()):
+            if idx % passo == 0:
+                selecionados.append(str(host))
+            if len(selecionados) >= limite:
+                break
+        return selecionados
+
+    # ── Parâmetros de varredura por tipo de interface (JanelaPrincipal) ──
+
+    def _parametros_iface_seguro(self, nome_iface: str) -> dict:
+        """
+        Replica o ajuste usado na thread de descoberta, mas disponível aqui
+        para configurar timers e flags antes de criar a thread.
+        """
+        nome_lower = (nome_iface or "").lower()
+        eh_wifi = any(p in nome_lower for p in ("wi-fi", "wifi", "wireless", "ax", "802.11"))
+
+        if eh_wifi:
+            return {
+                "batch": 8,
+                "inter": 0.0,
+                "sleep_lote": 0.25,
+                "pausa": 3.0,
+                "timeout": 2.8,
+                "tentativas": 1,
+                "limite_hosts": 128,
+                "desativar_icmp": True,
+                "wifi": True,
+                "timer_ms": 300000,  # 5 minutos, mas em Wi-Fi não iniciamos automático
+            }
+
+        return {
+            "batch": _DescobrirDispositivosThread.BATCH_ARP,
+            "inter": _DescobrirDispositivosThread.INTER_ARP,
+            "sleep_lote": 0.0,
+            "pausa": _DescobrirDispositivosThread.PAUSA_RODADAS,
+            "timeout": _DescobrirDispositivosThread.TIMEOUT_ARP,
+            "tentativas": _DescobrirDispositivosThread.TENTATIVAS,
+            "limite_hosts": _DescobrirDispositivosThread.MAX_HOSTS,
+            "desativar_icmp": False,
+            "wifi": False,
+            "timer_ms": 30000,
+        }
+
+    def _parametros_para_iface(self, nome_iface: str) -> dict:
+        """
+        Ajusta agressividade da varredura conforme tipo de interface.
+        Wi-Fi costuma derrubar conexões quando recebe bursts grandes de ARP.
+        """
+        nome_lower = (nome_iface or "").lower()
+        eh_wifi = any(p in nome_lower for p in ("wi-fi", "wifi", "wireless", "ax", "802.11"))
+
+        if eh_wifi:
+            return {
+                "batch":      8,      # bursts mínimos
+                "inter":      0.0,    # srp já vai com poucos pacotes; inter 0
+                "sleep_lote": 0.25,   # 250 ms entre lotes
+                "pausa":      3.0,    # espaçamento maior entre rodadas
+                "timeout":    2.8,    # tolerância extra para Wi‑Fi
+                "tentativas": 1,      # 1 rodada ativa
+                "limite_hosts": 128,  # não varrer blocos grandes via Wi‑Fi
+                "desativar_icmp": True,  # ICMP ativo desligado em Wi‑Fi
+                "wifi": True,
+                "timer_ms": 300000,   # varredura periódica a cada 5 min (lenta)
+            }
+
+        # padrão cabeado
+        return {
+            "batch":      self.BATCH_ARP,
+            "inter":      self.INTER_ARP,
+            "sleep_lote": 0.0,
+            "pausa":      self.PAUSA_RODADAS,
+            "timeout":    self.TIMEOUT_ARP,
+            "tentativas": self.TENTATIVAS,
+            "limite_hosts": self.MAX_HOSTS,
+            "desativar_icmp": False,
+            "wifi": False,
+            "timer_ms": 30000,
+        }
+
+    # ── Registro thread-safe ──────────────────────────────────────────
+
+    def _registrar(self, ip: str, mac: str, hostname: str):
+        with self._lock:
+            if ip in self._ips_encontrados:
+                return
+            self._ips_encontrados.add(ip)
+            if mac:
+                self._cache_mac[ip] = mac
+            self._dispositivos.append((ip, mac, hostname))
+        self.dispositivo_encontrado.emit(ip, mac, hostname)
+
+    # ── Utilitários ───────────────────────────────────────────────────
 
     @staticmethod
-    def _ip_util(ip: str) -> bool:
+    def _ip_valido(ip: str) -> bool:
         try:
             p = [int(x) for x in ip.split(".")]
-            if len(p) != 4:
-                return False
-            return not (
-                p[0] in (0, 127) or
-                (p[0] == 169 and p[1] == 254) or
-                224 <= p[0] <= 239 or
-                p[3] == 255
+            return len(p) == 4 and not (
+                p[0] in (0, 127)
+                or (p[0] == 169 and p[1] == 254)
+                or 224 <= p[0] <= 239
+                or p[3] == 255
             )
         except Exception:
             return False
 
-    def _cidr_por_interface(self) -> str:
+    def _detectar_cidr(self) -> str:
         try:
             from scapy.all import get_if_addr, get_if_netmask
             ip   = get_if_addr(self.interface)
             mask = get_if_netmask(self.interface)
-            if ip and mask:
-                bits = sum(bin(int(p)).count('1') for p in mask.split('.'))
-                return f"{ip}/{bits}"
+            if ip and mask and ip != "0.0.0.0":
+                prefixo = sum(bin(int(p)).count("1") for p in mask.split("."))
+                rede = ipaddress.ip_network(f"{ip}/{prefixo}", strict=False)
+                return str(rede)
         except Exception:
-            return ""
+            pass
         return ""
 
     @staticmethod
@@ -411,8 +704,8 @@ class _DescobrirDispositivosThread(QThread):
         ip = obter_ip_local()
         if not ip or ip == "127.0.0.1":
             return ""
-        partes = ip.split('.')
-        return f"{'.'.join(partes[:3])}.0/24" if len(partes) == 4 else ""
+        p = ip.split(".")
+        return f"{'.'.join(p[:3])}.0/24" if len(p) == 4 else ""
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -550,6 +843,10 @@ class JanelaPrincipal(QMainWindow):
 
         # EMA para suavização do KB/s (evita spikes no gráfico)
         self._kb_anterior: float = 0.0
+        self._param_arps: dict = {}
+        self._limite_hosts: int = _DescobrirDispositivosThread.MAX_HOSTS
+        self._eh_wifi: bool = False
+        self._periodo_timer_ms: int = 30000
 
         # ── Timers ────────────────────────────────────────────────────
         # _consumir_fila: apenas enfileira no analisador + coleta resultados
@@ -751,6 +1048,76 @@ class JanelaPrincipal(QMainWindow):
         prefixo = self._mascara_para_prefixo(mask) if mask else 24
         return f"{ip}/{prefixo}"
 
+    def _parametros_iface_seguro(self, nome_iface: str) -> dict:
+        """
+        Limites conservadores para Wi‑Fi e padrão para cabeada.
+        Usado antes de iniciar captura e ao instanciar a thread de descoberta.
+        """
+        nome_lower = (nome_iface or "").lower()
+        eh_wifi = any(p in nome_lower for p in ("wi-fi", "wifi", "wireless", "ax", "802.11"))
+
+        if eh_wifi:
+            return {
+                "batch": 8,
+                "inter": 0.0,
+                "sleep_lote": 0.25,
+                "pausa": 3.0,
+                "timeout": 2.8,
+                "tentativas": 1,
+                "limite_hosts": 128,
+                "desativar_icmp": True,
+                "wifi": True,
+                "timer_ms": 600000,  # 10 minutos
+            }
+
+        return {
+            "batch": _DescobrirDispositivosThread.BATCH_ARP,
+            "inter": _DescobrirDispositivosThread.INTER_ARP,
+            "sleep_lote": 0.0,
+            "pausa": _DescobrirDispositivosThread.PAUSA_RODADAS,
+            "timeout": _DescobrirDispositivosThread.TIMEOUT_ARP,
+            "tentativas": _DescobrirDispositivosThread.TENTATIVAS,
+            "limite_hosts": _DescobrirDispositivosThread.MAX_HOSTS,
+            "desativar_icmp": False,
+            "wifi": False,
+            "timer_ms": 30000,
+        }
+
+    def _parametros_iface_seguro(self, nome_iface: str) -> dict:
+        """
+        Define limites conservadores para Wi‑Fi e parâmetros normais para cabeada.
+        Usado antes de iniciar captura e para instanciar a thread de descoberta.
+        """
+        nome_lower = (nome_iface or "").lower()
+        eh_wifi = any(p in nome_lower for p in ("wi-fi", "wifi", "wireless", "ax", "802.11"))
+
+        if eh_wifi:
+            return {
+                "batch": 8,
+                "inter": 0.0,
+                "sleep_lote": 0.25,
+                "pausa": 3.0,
+                "timeout": 2.8,
+                "tentativas": 1,
+                "limite_hosts": 128,
+                "desativar_icmp": True,
+                "wifi": True,
+                "timer_ms": 300000,  # 5 minutos; não inicia automático em Wi‑Fi
+            }
+
+        return {
+            "batch": _DescobrirDispositivosThread.BATCH_ARP,
+            "inter": _DescobrirDispositivosThread.INTER_ARP,
+            "sleep_lote": 0.0,
+            "pausa": _DescobrirDispositivosThread.PAUSA_RODADAS,
+            "timeout": _DescobrirDispositivosThread.TIMEOUT_ARP,
+            "tentativas": _DescobrirDispositivosThread.TENTATIVAS,
+            "limite_hosts": _DescobrirDispositivosThread.MAX_HOSTS,
+            "desativar_icmp": False,
+            "wifi": False,
+            "timer_ms": 30000,
+        }
+
     def _gerar_historias(self) -> list:
         top_dns = self.analisador.obter_top_dns() if hasattr(self.analisador, "obter_top_dns") else []
         return [
@@ -840,6 +1207,12 @@ class JanelaPrincipal(QMainWindow):
         self._cidr_captura      = self._cidr_da_interface(desc_sel)
         self.painel_topologia.definir_rede_local(self._cidr_captura)
 
+        # Parâmetros seguros conforme tipo de interface
+        self._param_arps       = self._parametros_iface_seguro(self._interface_captura)
+        self._periodo_timer_ms = self._param_arps.get("timer_ms", 30000)
+        self._eh_wifi          = self._param_arps.get("wifi", False)
+        self._limite_hosts     = self._param_arps.get("limite_hosts", _DescobrirDispositivosThread.MAX_HOSTS)
+
         fila_pacotes_global.limpar()
         self.analisador.resetar()
         self._snapshot_atual = {
@@ -868,7 +1241,13 @@ class JanelaPrincipal(QMainWindow):
 
         self.timer_consumir.start(250)
         self.timer_ui.start(1500)
-        self.timer_descoberta.start(30000)
+        if self._eh_wifi:
+            # Em Wi‑Fi a varredura ativa só deve ser iniciada manualmente para evitar quedas.
+            self._status(
+                "Modo Wi‑Fi: captura passiva + varredura manual (lotes mínimos, limite 128)."
+            )
+        else:
+            self.timer_descoberta.start(self._periodo_timer_ms)
 
         self.em_captura = True
         self.botao_captura.setText("Parar Captura")
@@ -945,6 +1324,9 @@ class JanelaPrincipal(QMainWindow):
             # Atualiza topologia (operação Qt — rápida, sem I/O)
             if ip_origem:
                 self.painel_topologia.adicionar_dispositivo(ip_origem, mac_origem)
+            # Descoberta passiva: IPs de destino locais também são adicionados
+            if ip_destino:
+                self.painel_topologia.adicionar_dispositivo(ip_destino, "")
             if ip_origem and ip_destino:
                 self.painel_topologia.adicionar_conexao(ip_origem, ip_destino)
 
@@ -1143,6 +1525,7 @@ class JanelaPrincipal(QMainWindow):
         self.descobridor = _DescobrirDispositivosThread(
             interface=self._interface_captura,
             cidr=self._cidr_captura,
+            parametros=self._param_arps,
         )
         self.descobridor.dispositivo_encontrado.connect(self._ao_encontrar_dispositivo)
         self.descobridor.varredura_concluida.connect(self._ao_concluir_varredura)

@@ -507,14 +507,20 @@ class AnalisadorPacotes:
         return resultado
 
     def obter_top_dispositivos(self, top_n: int = 10) -> list:
+        # Snapshot thread-safe antes de iterar — evita RuntimeError
+        # quando _processar_dados_brutos adiciona chaves concorrentemente.
+        with self._lock:
+            enviado_snap  = dict(self._enviado)
+            recebido_snap = dict(self._recebido)
+
         agregado_env: defaultdict = defaultdict(int)
         agregado_rec: defaultdict = defaultdict(int)
 
-        for ip, v in self._enviado.items():
+        for ip, v in enviado_snap.items():
             chave = ip if _eh_local_rapido(ip) else "internet"
             agregado_env[chave] += v
 
-        for ip, v in self._recebido.items():
+        for ip, v in recebido_snap.items():
             chave = ip if _eh_local_rapido(ip) else "internet"
             agregado_rec[chave] += v
 
@@ -535,8 +541,12 @@ class AnalisadorPacotes:
         ]
 
     def obter_top_dns(self, top_n: int = 10) -> list:
+        # Snapshot thread-safe
+        with self._lock:
+            dns_snap = dict(self._top_dns)
+
         ordenados = sorted(
-            self._top_dns.items(),
+            dns_snap.items(),
             key=lambda x: x[1][0],
             reverse=True,
         )
