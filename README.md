@@ -1,9 +1,8 @@
 <div align="center">
 
-# 🌐 NetLab Educacional
+# 🌐 NetLab 
 
-### Monitor de Redes com Motor Pedagógico Integrado
-
+### Monitor de Redes com Motor
 *Transformando pacotes de rede em conhecimento didático em tempo real*
 
 ---
@@ -17,7 +16,7 @@
 
 **TCC — Curso Técnico em Informática**  
 **Instituto Federal Farroupilha — Campus Uruguaiana**  
-**Autor: Yuri Gonçalves Pavão · Versão 2.1 · Junho de 2025**
+**Autor: Yuri Gonçalves Pavão · Versão 3.0 · abril de 2026**
 
 </div>
 
@@ -420,7 +419,7 @@ Este projeto foi desenvolvido como **Trabalho de Conclusão de Curso (TCC)** do 
 **Aluno:** Yuri Gonçalves Pavão  
 **Instituição:** Instituto Federal Farroupilha — Campus Uruguaiana  
 **Curso:** Técnico em Informática  
-**Ano:** 2025
+**Ano:** 2026
 
 ---
 
@@ -448,13 +447,11 @@ Contribuições e sugestões de professores e alunos são bem-vindas.
 
 <div align="center">
 
-**NetLab Educacional v2.1** · Junho de 2025
+**NetLab Educacional v3.0** · Junho de 2025
 
 *Desenvolvido com 🧠 por Yuri Gonçalves Pavão*  
 *Instituto Federal Farroupilha — Campus Uruguaiana*
 
 ---
-
-*"Transformando pacotes de rede em conhecimento."*
 
 </div>
