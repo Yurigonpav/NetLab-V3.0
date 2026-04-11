@@ -1240,7 +1240,7 @@ class JanelaPrincipal(QMainWindow):
             return
 
         self.timer_consumir.start(250)
-        self.timer_ui.start(1500)
+        self.timer_ui.start(1000)
         if self._eh_wifi:
             # Em Wi‑Fi a varredura ativa só deve ser iniciada manualmente para evitar quedas.
             self._status(
