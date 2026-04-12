@@ -39,7 +39,7 @@
 
 ---
 
-## 🎯 Sobre o Projeto
+## Sobre o Projeto
 
 O **NetLab Educacional** é um software desktop de análise de redes concebido como ferramenta pedagógica para o ensino de redes de computadores em ambiente escolar. Funciona de forma conceitual similar a um Wireshark didático: captura tráfego real da rede e, em vez de exibir apenas dados brutos, traduz cada evento automaticamente em **explicações acessíveis em três níveis de profundidade**.
 
@@ -56,23 +56,23 @@ O ensino de redes frequentemente esbarra em uma barreira: ferramentas profission
 
 ---
 
-## ✨ Funcionalidades
+## Funcionalidades
 
-### 🔬 Captura e Análise de Pacotes
+### Captura e Análise de Pacotes
 - Captura em tempo real via **Scapy + Npcap** com suporte a TCP, UDP, DNS, ARP, ICMP, HTTP, HTTPS, DHCP, SSH, FTP, SMB e RDP
 - **Deep Packet Inspection (DPI)** para HTTP: extrai método, caminho, headers, corpo do formulário e credenciais em texto puro
 - Parser HTTP em **C nativo (ctypes)** para hot-path de alta performance, com fallback Python transparente
 - Detecção automática de **campos sensíveis** (senhas, tokens, e-mails) e alertas de segurança
 - Identificação de OS por TTL e fabricante por OUI (MAC address)
 
-### 📖 Motor Pedagógico com 3 Níveis de Explicação
+### Motor Pedagógico com 3 Níveis de Explicação
 - **Nível Simples** — linguagem do dia a dia, sem jargão técnico, acessível a qualquer estudante
 - **Nível Técnico** — detalhes de protocolo, portas, flags, vulnerabilidades e boas práticas
 - **Pacote Bruto** — conteúdo exato como trafegou na rede, com hexdump + ASCII e visualização de headers HTTP destacados
 - Análise automática de **indicadores de ataque**: injeção SQL, XSS, métodos HTTP incomuns, cookies expostos, headers de segurança ausentes
 - Cooldown inteligente por evento para evitar flood na interface em redes movimentadas
 
-### 🗺️ Visualizador de Topologia Interativo
+### Visualizador de Topologia Interativo
 - Mapa gráfico da rede local com zoom (scroll), pan (arrastar) e seleção de nós
 - Tamanho dos nós proporcional ao volume de tráfego (escala logarítmica)
 - Tooltip com hostname e IP ao passar o mouse; painel de detalhes ao clicar
@@ -80,25 +80,25 @@ O ensino de redes frequentemente esbarra em uma barreira: ferramentas profission
 - **ARP sweep automático** com múltiplas rodadas e retry para descoberta de hosts em redes com switches gerenciados
 - Agrupamento de IPs externos em nó "Internet"
 
-### 📊 Painel de Tráfego em Tempo Real
+### Painel de Tráfego em Tempo Real
 - Gráfico de KB/s com janela deslizante de 60 segundos (PyQtGraph, eixos fixos sem bug de escala)
 - Cards com total de pacotes, dados transmitidos, dispositivos ativos e velocidade atual
 - Tabela de protocolos detectados com contagem e volume de dados
 - Top dispositivos por tráfego (enviado, recebido e total)
 
-### 🔍 Aba Insights
+### Aba Insights
 - **Sites mais acessados** baseado em consultas DNS reais capturadas
 - **Classificação de uso da rede** por categoria (Navegação, Conexão Segura, Novo Dispositivo, etc.)
 - Diff incremental para evitar recriação desnecessária de widgets
 
-### 🖥️ Servidor HTTP Embutido para Demonstrações
+### Servidor HTTP Embutido para Demonstrações
 - Servidor multi-threaded com páginas de login, formulário e API JSON
 - **Modo Vulnerável**: senha em texto puro, sem limites — demonstra como credenciais aparecem capturadas
 - **Modo Seguro**: hash PBKDF2 + salt, rate limiting, bloqueio temporário de IP e CAPTCHA após falhas
 - Proteção contra DoS com controle de req/s por IP e desbloqueio manual
 - Monitoramento de requisições em tempo real com tabela e log de alertas
 
-### 🔐 Laboratório de Login (HTTP vs HTTPS)
+### Laboratório de Login (HTTP vs HTTPS)
 - Simulação interativa comparando autenticação vulnerável × protegida
 - Demonstração visual de como senhas aparecem em texto puro no HTTP
 - Como dados armazenados diferem entre texto puro e hash PBKDF2
@@ -111,7 +111,7 @@ O ensino de redes frequentemente esbarra em uma barreira: ferramentas profission
 
 ---
 
-## 🏗️ Arquitetura do Sistema
+## Arquitetura do Sistema
 
 O NetLab é organizado em **três camadas de performance** para garantir que a interface gráfica jamais trave, mesmo em redes com alto volume de tráfego:
 
@@ -200,7 +200,7 @@ O NetLab é organizado em **três camadas de performance** para garantir que a i
 
 ---
 
-## 📦 Instalação
+## Instalação
 
 ### Opção 1 — Instalador Automático (Recomendado)
 
@@ -270,7 +270,7 @@ python compilar_http_parser.py
 
 ---
 
-## 🚀 Como Usar
+## Como Usar
 
 ### 1. Iniciando a Captura
 
@@ -357,7 +357,7 @@ netlab-educacional/
 
 ---
 
-## 🔧 Detalhes Técnicos
+## Detalhes Técnicos
 
 ### netlab_core_lib.c — Buffer Circular de Alta Performance
 
@@ -410,7 +410,7 @@ _DescobrirDispositivosThread (daemon)
 
 ---
 
-## 🎓 Contexto Acadêmico
+## Contexto Acadêmico
 
 Este projeto foi desenvolvido como **Trabalho de Conclusão de Curso (TCC)** do **Curso Técnico em Informática** do **Instituto Federal Farroupilha (IFFar) — Campus Uruguaiana**.
 
@@ -436,7 +436,7 @@ Este projeto foi desenvolvido como **Trabalho de Conclusão de Curso (TCC)** do 
 
 ---
 
-## 📄 Licença
+## Licença
 
 Este software é distribuído para **uso acadêmico e educacional**.
 
@@ -449,7 +449,8 @@ Contribuições e sugestões de professores e alunos são bem-vindas.
 
 **NetLab Educacional v3.0** · Junho de 2025
 
-*Desenvolvido com 🧠 por Yuri Gonçalves Pavão*  
+*Desenvolvido por Yuri Gonçalves Pavão*  
+*Este projeto contou com o apoio de diversas LLMs (Large Language Models) para auxílio no desenvolvimento, revisão de código e otimização de funcionalidades, sempre sob supervisão e validação do autor.*
 *Instituto Federal Farroupilha — Campus Uruguaiana*
 
 ---
