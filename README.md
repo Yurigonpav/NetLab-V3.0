@@ -447,10 +447,11 @@ Contribuições e sugestões de professores e alunos são bem-vindas.
 
 <div align="center">
 
-**NetLab Educacional v3.0** · Junho de 2025
+**NetLab Educacional v3.0** · Abril de 2026
 
 *Desenvolvido por Yuri Gonçalves Pavão*  
 *Este projeto contou com o apoio de diversas LLMs (Large Language Models) para auxílio no desenvolvimento, revisão de código e otimização de funcionalidades, sempre sob supervisão e validação do autor.*
+
 *Instituto Federal Farroupilha — Campus Uruguaiana*
 
 ---
