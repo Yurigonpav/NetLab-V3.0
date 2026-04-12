@@ -1,6 +1,7 @@
 # painel_servidor.py
 # Versão corrigida - controles proporcionais e layout estável
 
+import socket
 import threading
 import time
 import secrets
@@ -22,7 +23,6 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject
 from PyQt6.QtGui import QFont, QColor
-from utils.rede import obter_ip_local, formatar_bytes
 
 
 #  Sinais para comunicação thread-safe 
@@ -230,6 +230,123 @@ class HandlerLabEducacional(BaseHTTPRequestHandler):
 </body>
 </html>"""
 
+    PAGINA_LOGIN = """<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login — NetLab</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(145deg, #0a0f1e 0%, #0f1423 100%);
+            color: #e0e4f0;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1.5rem;
+        }
+        .card {
+            background: rgba(18, 26, 40, 0.95);
+            backdrop-filter: blur(8px);
+            border: 1px solid #c03c3c;
+            border-radius: 36px;
+            padding: 2.5rem 2rem;
+            width: 100%;
+            max-width: 440px;
+            box-shadow: 0 30px 50px -15px #200000;
+        }
+        h2 {
+            color: #ff8a8a;
+            font-size: 2rem;
+            font-weight: 500;
+            margin-bottom: 1rem;
+            text-align: center;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+        }
+        .aviso {
+            background: #2a1212;
+            border: 1px solid #b33;
+            border-radius: 40px;
+            padding: 1rem;
+            color: #ffb0b0;
+            font-size: 0.9rem;
+            text-align: center;
+            margin-bottom: 2rem;
+            line-height: 1.4;
+        }
+        form {
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }
+        input {
+            width: 100%;
+            padding: 1rem 1.2rem;
+            background: #0d1a2a;
+            border: 1px solid #2a4a70;
+            border-radius: 40px;
+            color: #ecf0f1;
+            font-size: 1rem;
+            outline: none;
+            transition: border 0.2s;
+        }
+        input:focus {
+            border-color: #e77;
+        }
+        button {
+            background: #c03c3c;
+            color: white;
+            border: none;
+            border-radius: 40px;
+            padding: 1rem;
+            font-size: 1.2rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.2s, transform 0.1s;
+            margin-top: 0.5rem;
+        }
+        button:hover {
+            background: #d44;
+            transform: scale(1.02);
+        }
+        .voltar {
+            display: block;
+            text-align: center;
+            margin-top: 1.8rem;
+            color: #7f9fcf;
+            text-decoration: none;
+            font-size: 0.95rem;
+        }
+        .voltar:hover {
+            color: #9bc0ff;
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2> Login <span style="color:#e77;font-size:1.2rem;">(HTTP)</span></h2>
+        <form method="POST" action="/login">
+            <input type="text"     name="usuario"  placeholder="Usuário">
+            <input type="password" name="senha"    placeholder="Senha">
+            <input type="email"    name="email"    placeholder="E-mail">
+            <button type="submit">Entrar</button>
+        </form>
+        <a class="voltar" href="/">← Voltar ao início</a>
+    </div>
+</body>
+</html>"""
+
     PAGINA_FORMULARIO = """<!DOCTYPE html>
 <html lang="pt-BR">
 <head>
@@ -383,6 +500,24 @@ class HandlerLabEducacional(BaseHTTPRequestHandler):
             corpo = self._html_signup(seguro).encode("utf-8")
         elif self.path == "/formulario":
             corpo = self.PAGINA_FORMULARIO.encode("utf-8")
+        elif self.path == "/api/dados":
+            corpo = b'{"status":"ok","servidor":"NetLab","protocolo":"HTTP","criptografado":false}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(corpo)))
+            self.end_headers()
+            self.wfile.write(corpo)
+            self._registrar(ip_cliente, "GET", self.path, len(corpo), ts_inicio)
+            return
+        elif self.path == "/ping":
+            corpo = b'{"pong": true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(corpo)))
+            self.end_headers()
+            self.wfile.write(corpo)
+            self._registrar(ip_cliente, "GET", self.path, len(corpo), ts_inicio)
+            return
         else:
             corpo = b"<h1>404 - Pagina nao encontrada</h1>"
             self.send_response(404)
@@ -444,37 +579,26 @@ class HandlerLabEducacional(BaseHTTPRequestHandler):
                 bloqueado=bloqueado
             )
             return
-        if self.path == "/formulario":
-            resposta = (
-                f"<html><body style='background:#0f1423;color:#ecf0f1;"
-                f"font-family:Arial;padding:40px;'>"
-                f"<h2 style='color:#2ECC71;'>Dados recebidos pelo servidor!</h2>"
-                f"<p>O NetLab capturou este envio em tempo real.</p>"
-                f"<p style='color:#E74C3C;'>⚠️ Estes dados foram transmitidos "
-                f"via HTTP — visíveis para qualquer capturador na rede.</p>"
-                f"<a href='/' style='color:#3498DB;'>← Voltar</a>"
-                f"</body></html>"
-            ).encode("utf-8")
 
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(resposta)))
-            self.end_headers()
-            self.wfile.write(resposta)
-            self._registrar(
-                ip_cliente, "POST", self.path, tamanho, ts_inicio,
-                corpo=corpo_bytes.decode("utf-8", errors="replace")
-            )
-            return
+        resposta = (
+            f"<html><body style='background:#0f1423;color:#ecf0f1;"
+            f"font-family:Arial;padding:40px;'>"
+            f"<h2 style='color:#2ECC71;'>Dados recebidos pelo servidor!</h2>"
+            f"<p>O NetLab capturou este envio em tempo real.</p>"
+            f"</pre>"
+            f"<p style='color:#E74C3C;'>️ Estes dados foram transmitidos "
+            f"via HTTP — visíveis para qualquer capturador na rede.</p>"
+            f"<a href='/' style='color:#3498DB;'>← Voltar</a>"
+            f"</body></html>"
+        ).encode("utf-8")
 
-        corpo = b"<h1>404 - Pagina nao encontrada</h1>"
-        self.send_response(404)
+        self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(corpo)))
+        self.send_header("Content-Length", str(len(resposta)))
         self.end_headers()
-        self.wfile.write(corpo)
+        self.wfile.write(resposta)
         self._registrar(
-            ip_cliente, "POST", self.path, len(corpo), ts_inicio,
+            ip_cliente, "POST", self.path, tamanho, ts_inicio,
             corpo=corpo_bytes.decode("utf-8", errors="replace")
         )
 
@@ -692,9 +816,7 @@ class HandlerLabEducacional(BaseHTTPRequestHandler):
 </html>
 """
 
-    def _servir_bloqueado(self, ttl_bloqueio: Optional[int] = None):
-        if ttl_bloqueio is None or ttl_bloqueio <= 0:
-            ttl_bloqueio = self.__class__._tempo_bloqueio
+    def _servir_bloqueado(self):
         corpo = (
             b"<html><body style='background:#0f1423;color:#E74C3C;"
             b"font-family:Arial;padding:40px;text-align:center;'>"
@@ -707,7 +829,7 @@ class HandlerLabEducacional(BaseHTTPRequestHandler):
         self.send_response(429)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(corpo)))
-        self.send_header("Retry-After", str(ttl_bloqueio))
+        self.send_header("Retry-After", str(self.__class__._tempo_bloqueio))
         self.end_headers()
         self.wfile.write(corpo)
 
@@ -1376,7 +1498,7 @@ class PainelServidor(QWidget):
         self.btn_iniciar.setObjectName("botao_parar")
         self._repolir(self.btn_iniciar)
 
-        ip_local = obter_ip_local()
+        ip_local = self._obter_ip_local()
         self.lbl_status.setText("  Servidor ativo")
         self.lbl_status.setStyleSheet(
             "color: #2ECC71; font-weight: bold; font-size: 11px;"
@@ -1477,7 +1599,10 @@ class PainelServidor(QWidget):
 
         # Atualizar métricas
         self.lbl_total_reqs.setText(f"{self._total_requisicoes:,}")
-        self.lbl_total_bytes.setText(formatar_bytes(self._total_bytes))
+        kb = self._total_bytes / 1024
+        self.lbl_total_bytes.setText(
+            f"{kb/1024:.1f} MB" if kb > 1024 else f"{kb:.1f} KB"
+        )
         self.lbl_clientes.setText(str(len(self._clientes_unicos)))
 
         # Alertas para POST
@@ -1510,6 +1635,14 @@ class PainelServidor(QWidget):
             cursor.removeSelectedText()
 
     #  Métodos auxiliares 
+
+    def _obter_ip_local(self) -> str:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("8.8.8.8", 80))
+                return s.getsockname()[0]
+        except Exception:
+            return "127.0.0.1"
 
     def _repolir(self, widget):
         widget.style().unpolish(widget)
@@ -1561,6 +1694,9 @@ class PainelServidor(QWidget):
             self.lbl_status.setText(
                 " Modo seguro: proteções ligadas" if ativar_protecao else "️ Modo vulnerável: sem limites"
             )
+
+
+
 
 
 
