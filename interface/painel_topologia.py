@@ -161,7 +161,6 @@ class VisualizadorTopologia(QWidget):
     COR_NO_INTERNET = QColor(155,  89, 182)
     COR_TEXTO       = QColor(236, 240, 241)
     COR_LEGENDA     = QColor(120, 140, 160)
-    MAX_CONEXOES    = 20
     RAIO_BASE       = 16
     RAIO_MIN        = 7
     RAIO_MAX        = 30
@@ -323,13 +322,12 @@ class VisualizadorTopologia(QWidget):
             self._rede_local = None
 
     def _pertence_rede(self, ip: str) -> bool:
+        """Exibe individualmente qualquer IP privado RFC1918 (10.x, 172.16-31.x, 192.168.x)."""
         if not ip or not eh_endereco_valido(ip):
             return False
-        if self._rede_local is None:
-            return eh_ip_local(ip)
         try:
             import ipaddress
-            return ipaddress.ip_address(ip) in self._rede_local
+            return ipaddress.ip_address(ip).is_private
         except Exception:
             return eh_ip_local(ip)
 
@@ -372,7 +370,7 @@ class VisualizadorTopologia(QWidget):
         top = sorted(
             self.contagem_conexoes.items(),
             key=lambda x: x[1], reverse=True
-        )[:self.MAX_CONEXOES]
+        )
         maximo = top[0][1] if top else 1
 
         for (no_a, no_b), contagem in top:

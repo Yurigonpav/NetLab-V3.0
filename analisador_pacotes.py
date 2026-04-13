@@ -67,9 +67,9 @@ from utils.constantes import PORTAS_HTTP, PORTAS_HTTPS, PORTAS_DHCP
 from utils.rede import eh_ip_local, _CACHE_LOCAL
 
 # ── Configuracao das filas ───────────────────────────────────
-MAXQ_ENTRADA = 8_000   # pacotes aguardando analise
-MAXQ_SAIDA   = 2_000   # eventos aguardando consumo pelo Qt
-BATCH_SIZE   = 100     # pacotes processados por iteracao do thread
+MAXQ_ENTRADA = 20_000   # pacotes aguardando analise
+MAXQ_SAIDA   = 5_000    # eventos aguardando consumo pelo Qt
+BATCH_SIZE   = 200      # pacotes processados por iteracao do thread
 SLEEP_VAZIO  = 0.005   # segundos de sleep quando fila vazia (5ms)
 
 # ── Regex pre-compiladas (fallback Python) ───────────────────
@@ -490,21 +490,27 @@ class AnalisadorPacotes:
         return resultado
 
     def obter_top_dispositivos(self, top_n: int = 10) -> list:
-        # Snapshot thread-safe antes de iterar — evita RuntimeError
-        # quando _processar_dados_brutos adiciona chaves concorrentemente.
         with self._lock:
             enviado_snap  = dict(self._enviado)
             recebido_snap = dict(self._recebido)
+
+        import ipaddress
+
+        def _eh_privado(ip: str) -> bool:
+            try:
+                return ipaddress.ip_address(ip).is_private
+            except Exception:
+                return False
 
         agregado_env: defaultdict = defaultdict(int)
         agregado_rec: defaultdict = defaultdict(int)
 
         for ip, v in enviado_snap.items():
-            chave = ip if eh_ip_local(ip) else "internet"
+            chave = ip if _eh_privado(ip) else "internet"
             agregado_env[chave] += v
 
         for ip, v in recebido_snap.items():
-            chave = ip if eh_ip_local(ip) else "internet"
+            chave = ip if _eh_privado(ip) else "internet"
             agregado_rec[chave] += v
 
         ips = set(agregado_env) | set(agregado_rec)

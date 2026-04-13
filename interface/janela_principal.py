@@ -128,7 +128,7 @@ class _FilaPacotesGlobal:
     """Buffer circular thread-safe. maxlen=5000 descarta automaticamente em picos."""
 
     def __init__(self):
-        self._fila: deque = deque(maxlen=5_000)
+        self._fila: deque = deque(maxlen=20_000)
         self._lock = threading.Lock()
 
     def adicionar(self, pacote: dict):
@@ -190,6 +190,7 @@ class _CapturadorPacotesThread(QThread):
                 # Inclui ARP para contabilizar descoberta local corretamente.
                 filter="ip or arp",
                 session=TCPSession,
+                promisc=True,
             )
             self.sniffer.start()
             while self._rodando:
@@ -307,7 +308,11 @@ class _CapturadorPacotesThread(QThread):
     def parar(self):
         self._rodando = False
         if self.sniffer:
-            self.sniffer.stop()
+            try:
+                if getattr(self.sniffer, 'running', False):
+                    self.sniffer.stop()
+            except Exception:
+                pass
         self.wait(3000)
 
 
@@ -410,13 +415,12 @@ class _DescobrirDispositivosThread(QThread):
             if not self._eh_wifi:
                 try:
                     rede_obj = ipaddress.ip_network(rede_cidr, strict=False)
-                    if rede_obj.prefixlen >= 24 and len(self._ips_encontrados) < 30:
-                        novo_prefixo = max(22, rede_obj.prefixlen - 2)
+                    if rede_obj.prefixlen >= 24:
+                        novo_prefixo = max(21, rede_obj.prefixlen - 2)
                         rede_expandida = str(rede_obj.supernet(new_prefix=novo_prefixo))
                         if rede_expandida != rede_cidr:
                             self.progresso_atualizado.emit(
-                                f"Poucas respostas em {rede_cidr}. "
-                                f"Expandindo para {rede_expandida} …"
+                                f"Expandindo busca: {rede_cidr} → {rede_expandida} …"
                             )
                             self._varrer_arp(rede_expandida)
                             self._varrer_icmp(rede_expandida)
@@ -1148,6 +1152,9 @@ class JanelaPrincipal(QMainWindow):
             )
         else:
             self.timer_descoberta.start(self._periodo_timer_ms)
+
+        # Varredura imediata 2 segundos após iniciar (sem esperar 30s)
+        QTimer.singleShot(2000, self._descoberta_periodica)
 
         self.em_captura = True
         self.botao_captura.setText("Parar Captura")

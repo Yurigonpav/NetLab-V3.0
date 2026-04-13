@@ -641,19 +641,21 @@ class PainelTrafego(QWidget):
         self._curva_ema.setData(x=x, y=ema)
 
         # ── Transição suave do teto Y ─────────────────────────────────────────
-        # Calcula o novo alvo com margem de 35%.
+        # Substituir o bloco inteiro de teto Y por:
         maximo = max(max(ema, default=0.0), max(raw, default=0.0))
         alvo   = max(maximo * 1.35, 10.0)
 
-        # Eleva rápido (sem cortar picos), abaixa devagar (sem tremer).
         if alvo > self._teto_y_alvo:
             self._teto_y_alvo = alvo
-        elif alvo < self._teto_y_alvo * 0.60:
-            # Relaxa o teto suavemente — nunca mais que 8% por frame
-            self._teto_y_alvo = self._teto_y_alvo * 0.92 + alvo * 0.08
+        elif alvo < self._teto_y_alvo * 0.40:
+            # Desce rápido: 50% por frame em vez de 8%
+            self._teto_y_alvo = self._teto_y_alvo * 0.5 + alvo * 0.5
+        else:
+            # Zona intermediária: desce moderado
+            self._teto_y_alvo = self._teto_y_alvo * 0.85 + alvo * 0.15
 
-        # Interpola o teto atual em direção ao alvo (25% por frame)
-        self._teto_y += (self._teto_y_alvo - self._teto_y) * 0.25
+        # Interpolação mais rápida (0.4 em vez de 0.25)
+        self._teto_y += (self._teto_y_alvo - self._teto_y) * 0.4
         self._teto_y  = max(self._teto_y, 10.0)
 
         self._plot_widget.setYRange(0, self._teto_y,           padding=0)
