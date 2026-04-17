@@ -1,19 +1,4 @@
 ﻿# interface/janela_principal.py
-# Janela principal do NetLab Educacional — versão com concorrência corrigida.
-#
-# CORREÇÕES DESTA VERSÃO
-# ─────────────────────────────────────────────────────────────────────────
-# 1. _EscritorBanco  — thread daemon que executa todos os commits SQLite
-#    fora da UI thread, eliminando o travamento causado por I/O de disco.
-#
-# 2. AnalisadorPacotes em modo assíncrono  — a análise de pacotes ocorre
-#    na ThreadAnalisador (já existente no analisador_pacotes.py), não mais
-#    no timer da UI thread.
-#    • _consumir_fila() apenas enfileira pacotes e coleta resultados prontos.
-#    • A UI thread nunca mais executa processar_pacote() diretamente.
-#
-# 3. _consumir_fila() simplificado  — sem nenhuma operação pesada; despacha
-#    dados para threads especializadas e atualiza apenas o snapshot em memória.
 
 import threading
 import time
@@ -33,59 +18,12 @@ from PyQt6.QtGui import QAction, QFont
 
 from analisador_pacotes import AnalisadorPacotes
 from motor_pedagogico import MotorPedagogico
-from banco_dados import BancoDados
 from interface.painel_topologia import PainelTopologia
 from interface.painel_trafego import PainelTrafego
 from interface.painel_eventos import PainelEventos
 from painel_servidor import PainelServidor
 from utils.constantes import PORTAS_HTTP, PORTAS_DHCP
 from utils.rede import obter_ip_local
-
-
-# ════════════════════════════════════════════════════════════════════════
-# Thread de escrita assíncrona no banco de dados
-# ════════════════════════════════════════════════════════════════════════
-
-class _EscritorBanco(threading.Thread):
-    """
-    Thread daemon que consome operações de escrita no SQLite de forma
-    assíncrona.  A UI thread nunca bloqueia em commit() novamente.
-
-    Uso:
-        escritor.enfileirar(banco.salvar_pacote, (args...))
-        escritor.enfileirar(banco.salvar_dispositivo, (args...))
-    """
-
-    def __init__(self, banco: BancoDados):
-        super().__init__(name="NetLab-EscritorBanco", daemon=True)
-        self._banco  = banco
-        self._fila:  deque = deque()
-        self._lock   = threading.Lock()
-        self._rodando = True
-
-    def enfileirar(self, metodo, args: tuple = ()):
-        """Adiciona uma operação à fila de escrita. Thread-safe."""
-        with self._lock:
-            self._fila.append((metodo, args))
-
-    def run(self):
-        while self._rodando:
-            lote = []
-            with self._lock:
-                while self._fila:
-                    lote.append(self._fila.popleft())
-
-            for metodo, args in lote:
-                try:
-                    metodo(*args)
-                except Exception:
-                    pass  # falhas de escrita não travam a aplicação
-
-            if not lote:
-                time.sleep(0.05)   # 50 ms de espera quando fila vazia
-
-    def parar(self):
-        self._rodando = False
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -327,25 +265,6 @@ class _CapturadorPacotesThread(QThread):
                 pass
         self.wait(3000)
 
-
-# ════════════════════════════════════════════════════════════════════════
-# _DescobrirDispositivosThread — versão aprimorada para redes institucionais
-#
-# MELHORIAS EM RELAÇÃO À VERSÃO ANTERIOR:
-#
-#   1. ARP com 3 tentativas (retry) — pacotes perdidos por switches com
-#      STP/port-security são recuperados nas retransmissões.
-#
-#   2. ICMP paralelo real — ping em lote com sr() cobrindo hosts que
-#      eventualmente bloqueiam ARP; mantém timeout curto e paralelismo.
-#
-#   3. Detecção de múltiplas sub-redes — se a instituição usa /22 ou /23,
-#      o varredor expande automaticamente o escopo de busca.
-#
-#   4. Envio ARP manual em broadcast — contorna filtros de switches que
-#      bloqueiam a implementação padrão do arping() do Scapy.
-#
-#   5. Descoberta passiva aprimorada — aproveita IPs já vistos na captura
 class _DescobrirDispositivosThread(QThread):
     """
     Descoberta de hosts via ARP sweep massivo com múltiplas rodadas.
@@ -787,21 +706,15 @@ class _WorkerRunnable(QRunnable):
 class JanelaPrincipal(QMainWindow):
     """Janela principal do NetLab Educacional — concorrência corrigida."""
 
-    def __init__(self, banco: BancoDados):
+    def __init__(self):
         super().__init__()
-        self.banco            = banco
         self.analisador       = AnalisadorPacotes()
         self.motor_pedagogico = MotorPedagogico()
-
-        # Thread de escrita assíncrona no banco (elimina travamentos SQLite)
-        self._escritor_banco = _EscritorBanco(banco)
-        self._escritor_banco.start()
 
         self.capturador:  _CapturadorPacotesThread     = None
         self.descobridor: _DescobrirDispositivosThread = None
         self.descoberta_rodando: bool = False
 
-        self.sessao_id:  int  = None
         self.em_captura: bool = False
 
         self._mapa_interface_nome:    dict = {}
@@ -1178,7 +1091,6 @@ class JanelaPrincipal(QMainWindow):
         }
         self._bytes_total_anterior = 0
         self._instante_anterior    = time.perf_counter()
-        self.sessao_id             = self.banco.iniciar_sessao()
 
         # Inicia thread de análise assíncrona
         self.analisador.iniciar_thread()
@@ -1228,14 +1140,6 @@ class JanelaPrincipal(QMainWindow):
         # Para thread de análise e coleta resultados finais
         self.analisador.parar_thread()
         self._consumir_fila()
-
-        if self.sessao_id:
-            self._escritor_banco.enfileirar(
-                self.banco.finalizar_sessao,
-                (self.sessao_id,
-                 self.analisador.total_pacotes,
-                 self.analisador.total_bytes),
-            )
 
         self._interface_captura = ""
         self._cidr_captura      = ""
@@ -1288,10 +1192,7 @@ class JanelaPrincipal(QMainWindow):
 
             # Salva dispositivo no banco em background
             if ip_origem:
-                self._escritor_banco.enfileirar(
-                    self.banco.salvar_dispositivo,
-                    (ip_origem, mac_origem),
-                )
+                pass  # Sem persistência (banco de dados removido)
 
             # Filtragem e enfileiramento de eventos pedagógicos
             if tipo:
@@ -1327,23 +1228,7 @@ class JanelaPrincipal(QMainWindow):
                             self.fila_eventos_ui.append(evento)
 
         # 3. Amostragem para banco (1 em cada 5 pacotes — em background)
-        if pacotes:
-            for i, dados in enumerate(pacotes):
-                if i % 5 == 0:
-                    self._escritor_banco.enfileirar(
-                        self.banco.salvar_pacote,
-                        (
-                            dados.get("ip_origem",    ""),
-                            dados.get("ip_destino",   ""),
-                            dados.get("mac_origem",   ""),
-                            dados.get("mac_destino",  ""),
-                            dados.get("protocolo",    ""),
-                            dados.get("tamanho",      0),
-                            dados.get("porta_origem"),
-                            dados.get("porta_destino"),
-                            self.sessao_id,
-                        ),
-                    )
+        # Banco de dados removido — sem persistência
 
         # 4. Atualiza snapshot em memória (sem I/O)
         self._snapshot_atual = {
@@ -1471,21 +1356,11 @@ class JanelaPrincipal(QMainWindow):
         Overhead por evento: ~0 (sem criação/destruição de thread do SO).
         O resultado chega via _sinal_pedagogico_global.resultado → UI thread.
         """
-        evento["sessao_id"] = self.sessao_id
         runnable = _WorkerRunnable(evento, self.motor_pedagogico)
         self._thread_pool.start(runnable)
 
     def _finalizar_exibicao_evento(self, explicacao: dict):
         self.painel_eventos.adicionar_evento(explicacao)
-        self._escritor_banco.enfileirar(
-            self.banco.salvar_evento,
-            (
-                explicacao.get("tipo", ""),
-                explicacao.get("nivel1", "")[:500],
-                explicacao.get("ip_envolvido", ""),
-                self.sessao_id,
-            ),
-        )
 
     def _finalizar_workers(self):
         # Aguarda todos os workers do pool terminarem (máx. 3s)
@@ -1562,9 +1437,6 @@ class JanelaPrincipal(QMainWindow):
     @pyqtSlot(str, str, str)
     def _ao_encontrar_dispositivo(self, ip: str, mac: str, hostname: str):
         self.painel_topologia.adicionar_dispositivo_manual(ip, mac, hostname)
-        self._escritor_banco.enfileirar(
-            self.banco.salvar_dispositivo, (ip, mac, hostname)
-        )
         self.fila_eventos_ui.append({
             "tipo": "NOVO_DISPOSITIVO", "ip_origem": ip,
             "ip_destino": "", "mac_origem": mac,
@@ -1617,7 +1489,7 @@ class JanelaPrincipal(QMainWindow):
         "<p>Plataforma educacional para análise de redes locais com captura de pacotes em tempo real e explicações didáticas automatizadas.</p>"
         "<hr>"
         "<p><b>TCC — Curso Técnico em Informática</b></p>"
-        "<p><b>Tecnologias:</b> Python · PyQt6 · Scapy · SQLite · PyQtGraph</p>"
+        "<p><b>Tecnologias:</b> Python · PyQt6 · Scapy · PyQtGraph</p>"
         "<p><b>Destaques:</b> DPI, detecção de dados sensíveis, identificação via MAC/OUI e monitoramento em tempo real.</p>"
         "<p><b>Autor:</b> Yuri Gonçalves Pavão</p>"
         "<p><b>Instagram:</b> @yuri_g0n | <b>GitHub:</b> github.com/yurigonp</p>"
@@ -1627,6 +1499,4 @@ class JanelaPrincipal(QMainWindow):
         self._finalizar_workers()
         if self.em_captura:
             self._parar_captura()
-        self._escritor_banco.parar()
-        self.banco.fechar()
         evento.accept()

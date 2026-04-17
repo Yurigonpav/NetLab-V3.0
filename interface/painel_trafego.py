@@ -165,9 +165,8 @@ class PainelTrafego(QWidget):
         self.card_pacotes      = CardEstatistica("TOTAL DE PACOTES",    "0",      "#3498DB")
         self.card_dados        = CardEstatistica("DADOS TRANSMITIDOS",  "0 KB",   "#2ECC71")
         self.card_dispositivos = CardEstatistica("DISPOSITIVOS ATIVOS", "0",      "#E74C3C")
-        self.card_velocidade   = CardEstatistica("VELOCIDADE ATUAL",    "0 KB/s", "#9B59B6")
         for c in (self.card_pacotes, self.card_dados,
-                  self.card_dispositivos, self.card_velocidade):
+                  self.card_dispositivos):
             row.addWidget(c)
         layout.addLayout(row)
 
@@ -491,11 +490,6 @@ class PainelTrafego(QWidget):
         ativos = total_ativos if total_ativos is not None else len(top_dispositivos)
         self.card_dispositivos.definir_valor(str(ativos))
 
-        # Velocidade: sempre mostra o ponto mais recente (ao vivo), não o
-        # offset de navegação — o card reflete a rede agora, não o histórico.
-        vel = self._buffer_ema[-1] if self._buffer_ema else 0.0
-        self.card_velocidade.definir_valor(f"{vel:.1f} KB/s")
-
         # ── Tabela de protocolos ───────────────────────────────────────────────
         fonte_c = QFont("Consolas", 9)
         fonte_c.setBold(True)
@@ -578,10 +572,9 @@ class PainelTrafego(QWidget):
         self.tabela_dispositivos.setRowCount(0)
 
         for c in (self.card_pacotes, self.card_dados,
-                  self.card_dispositivos, self.card_velocidade):
+                  self.card_dispositivos):
             c.definir_valor("0")
         self.card_dados.definir_valor("0 KB")
-        self.card_velocidade.definir_valor("0 KB/s")
 
         if hasattr(self, "_lbl_posicao"):
             self._lbl_posicao.setText("  ● Ao vivo")

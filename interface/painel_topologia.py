@@ -168,7 +168,7 @@ class VisualizadorTopologia(QWidget):
     RAIO_MIN        = 7
     RAIO_MAX        = 30
     MAX_DISPOSITIVOS = 50               # Limite realista: apenas dispositivos com tráfego real
-    TIMEOUT_INATIVIDADE = 60          
+    TIMEOUT_INATIVIDADE = 600          
 
     def __init__(self, parent=None):
         super().__init__(parent)

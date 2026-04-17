@@ -10,7 +10,6 @@
 ![Python](https://img.shields.io/badge/Python-3.11-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![PyQt6](https://img.shields.io/badge/PyQt6-6.x-41CD52?style=for-the-badge&logo=qt&logoColor=white)
 ![Scapy](https://img.shields.io/badge/Scapy-2.x-FF6B35?style=for-the-badge)
-![SQLite](https://img.shields.io/badge/SQLite-3-003B57?style=for-the-badge&logo=sqlite&logoColor=white)
 ![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D4?style=for-the-badge&logo=windows&logoColor=white)
 ![License](https://img.shields.io/badge/Licença-Acadêmica%20%2F%20Educacional-green?style=for-the-badge)
 
@@ -104,11 +103,6 @@ O ensino de redes frequentemente esbarra em uma barreira: ferramentas profission
 - Como dados armazenados diferem entre texto puro e hash PBKDF2
 - Simulação de força bruta com métricas de tempo e número de tentativas
 
-### 🗄️ Persistência com SQLite
-- Banco de dados local com tabelas para sessões, pacotes, dispositivos e eventos pedagógicos
-- Escrita assíncrona via thread dedicada (`_EscritorBanco`) — nenhum commit bloqueia a UI
-- Amostragem de 1 em cada 5 pacotes para controle de memória e performance
-
 ---
 
 ## Arquitetura do Sistema
@@ -136,12 +130,6 @@ O NetLab é organizado em **três camadas de performance** para garantir que a i
 │  Decodifica Ether / IP / TCP / UDP / DNS / ARP / Raw               │
 └─────────────────────────────────────────────────────────────────────┘
 
-┌─────────────────────────────────────────────────────────────────────┐
-│                    _EscritorBanco (thread daemon)                   │
-│  Fila de operações SQLite · commit nunca ocorre na UI thread        │
-│  Amostragem 1:5 pacotes · salvar_dispositivo / salvar_evento       │
-└─────────────────────────────────────────────────────────────────────┘
-
 ┌──────────────────────┐    ┌──────────────────────────────────────────┐
 │  netlab_core_lib.c   │    │  http_parser.c                           │
 │  Buffer circular C   │    │  Parser HTTP minimalista (ctypes)        │
@@ -155,7 +143,6 @@ O NetLab é organizado em **três camadas de performance** para garantir que a i
 | Decisão | Motivo |
 |---|---|
 | `deque(maxlen=N)` em todas as filas | Zero OOM mesmo em picos — descarte automático do mais antigo |
-| `_EscritorBanco` thread separada | Commits SQLite levam 5–50ms; executar na UI thread congela o gráfico |
 | `QThreadPool` (máx 4) para DPI | Substitui criação de 1 `QThread` por evento — elimina vazamento de threads |
 | Parser HTTP em C (ctypes) | Parsing de regex em Python é gargalo em capturas de alto volume |
 | EMA α=0,3 no gráfico KB/s | Suaviza spikes sem atrasar a leitura visual da velocidade real |
@@ -172,7 +159,6 @@ O NetLab é organizado em **três camadas de performance** para garantir que a i
 | **PyQt6** | 6.x | Interface gráfica (janelas, painéis, widgets) |
 | **Scapy** | 2.x | Captura e decodificação de pacotes de rede |
 | **PyQtGraph** | latest | Gráfico de tráfego em tempo real (alto desempenho) |
-| **SQLite** | 3 | Persistência local de sessões e eventos |
 | **ReportLab** | latest | Geração de relatórios PDF |
 | **Npcap** | 1.87+ | Driver de captura de pacotes para Windows |
 | **GCC / MSVC** | — | Compilação dos módulos C nativos |
@@ -322,7 +308,6 @@ Para cada evento capturado (DNS, HTTP, HTTPS, ARP, TCP, etc.):
 netlab-educacional/
 │
 ├── main.py                      # Ponto de entrada — inicializa Qt, tema e janela
-├── banco_dados.py               # Camada de persistência SQLite
 ├── analisador_pacotes.py        # Processamento de pacotes (3 camadas async)
 ├── motor_pedagogico.py          # Geração de explicações didáticas por protocolo
 ├── netlab_core.py               # Wrapper ctypes para netlab_core_lib
@@ -345,9 +330,6 @@ netlab-educacional/
 ├── recursos/
 │   └── estilos/
 │       └── tema_escuro.qss      # Folha de estilos Qt (tema dark personalizado)
-│
-├── dados/
-│   └── historico.db             # Banco SQLite (criado automaticamente)
 │
 ├── requirements.txt             # Dependências Python
 ├── build_exe.bat                # Script de build do executável (PyInstaller)
@@ -400,9 +382,6 @@ ThreadAnalisador (daemon)
 
 _CapturadorPacotesThread (daemon)
   └── AsyncSniffer (Scapy) → fila_pacotes_global
-
-_EscritorBanco (daemon)
-  └── fila de commits SQLite → sem bloqueio na UI
 
 _DescobrirDispositivosThread (daemon)
   └── ARP sweep (3 rodadas, lotes de 256)

@@ -10,7 +10,6 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QPalette, QColor
 
 from interface.janela_principal import JanelaPrincipal
-from banco_dados import BancoDados
 
 
 def resource_path(relative_path):
@@ -49,12 +48,8 @@ def iniciar_aplicacao():
         print(f"ERRO: Arquivo de estilo não encontrado em {caminho_estilo}")
         print("   Verifique se o arquivo foi incluído no build com --add-data")
 
-    # Inicializar banco de dados
-    banco = BancoDados()
-    banco.inicializar()
-
     # Criar e exibir a janela principal
-    janela = JanelaPrincipal(banco)
+    janela = JanelaPrincipal()
     janela.show()
 
     sys.exit(app.exec())

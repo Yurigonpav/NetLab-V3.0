@@ -345,7 +345,7 @@ class PainelEventos(QWidget):
         l_expl.setContentsMargins(4, 0, 0, 0)
         l_expl.setSpacing(4)
 
-        lbl_expl = QLabel("📖  Explicação Didática")
+        lbl_expl = QLabel("Explicação")
         lbl_expl.setStyleSheet("font-weight:bold;font-size:11px;color:#bdc3c7;")
         l_expl.addWidget(lbl_expl)
 
@@ -1130,7 +1130,7 @@ class PainelEventos(QWidget):
                     line-height:1.7;color:#ecf0f1;">
           <h3 style="color:{cor};margin:0 0 4px 0;">{titulo}</h3>
           <p style="color:#7f8c8d;font-size:10px;margin:0 0 10px 0;">
-            🕐 {hora} &nbsp;·&nbsp;
+             {hora} &nbsp;·&nbsp;
             <code style="color:#3498DB;">{ip_linha}</code>
             &nbsp;·&nbsp; Ocorrências: <b>{cont}</b>
             &nbsp;·&nbsp; Nesta sessão: <b>{cont_s}</b>
@@ -1153,7 +1153,7 @@ class PainelEventos(QWidget):
         <div style="font-family:Arial,sans-serif;font-size:11px;
                     line-height:1.7;color:#ecf0f1;padding:4px;">
           <h3 style="color:#3498DB;margin:0 0 10px 0;">
-            👋 Bem-vindo ao Modo Análise
+             Bem-vindo ao Modo Análise
           </h3>
           <p>Este painel transforma pacotes reais capturados da rede em
           <b>explicações didáticas automáticas</b> em três níveis de
