@@ -1663,7 +1663,7 @@ class JanelaPrincipal(QMainWindow):
             "<p><b>Tecnologias:</b> Python · PyQt6 · Scapy · PyQtGraph</p>"
             "<p><b>Destaques:</b> DPI, detecção de dados sensíveis, identificação via MAC/OUI e monitoramento em tempo real.</p>"
             "<p><b>Autor:</b> Yuri Gonçalves Pavão</p>"
-            "<p><b>Instagram:</b> @yuri_g0n | <b>GitHub:</b> github.com/yurigonp</p>"
+            "<p><b>Instagram:</b> @yuri_g0n | <b>GitHub:</b> github.com/yurigonpav</p>"
         )
 
     def closeEvent(self, evento):
