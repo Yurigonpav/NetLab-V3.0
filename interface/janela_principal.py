@@ -3,6 +3,9 @@
 import threading
 import time
 import ipaddress
+import subprocess
+import re
+import ctypes
 from collections import deque
 from typing import Optional
 
@@ -26,9 +29,9 @@ from utils.constantes import PORTAS_HTTP, PORTAS_DHCP
 from utils.rede import obter_ip_local
 
 
-# ════════════════════════════════════════════════════════════════════════
+# ============================================================================
 # Estado da rede (cooldown e dispositivos)
-# ════════════════════════════════════════════════════════════════════════
+# ============================================================================
 
 class EstadoRede:
     """Gerencia cooldown de eventos e descoberta de dispositivos."""
@@ -58,12 +61,12 @@ class EstadoRede:
         return self.dispositivos.get(ip)
 
 
-# ════════════════════════════════════════════════════════════════════════
-# Fila global de pacotes (preenchida pelo sniffer, consumida pelo analisador)
-# ════════════════════════════════════════════════════════════════════════
+# ============================================================================
+# Fila global de pacotes
+# ============================================================================
 
 class _FilaPacotesGlobal:
-    """Buffer circular thread-safe. maxlen=5000 descarta automaticamente em picos."""
+    """Buffer circular thread-safe."""
 
     def __init__(self):
         self._fila: deque = deque(maxlen=20_000)
@@ -100,12 +103,30 @@ def obter_interfaces_disponiveis() -> list:
         return []
 
 
-# ════════════════════════════════════════════════════════════════════════
+# ============================================================================
 # Thread do sniffer (AsyncSniffer do Scapy)
-# ════════════════════════════════════════════════════════════════════════
+# ============================================================================
+
+# Limite de pacotes por segundo aceitos pelo sniffer.
+# Pacotes acima desse limite são descartados silenciosamente para evitar
+# que picos de tráfego travem a fila e a UI.
+_MAX_PACOTES_POR_SEGUNDO = 800
+
 
 class _CapturadorPacotesThread(QThread):
-    """Captura pacotes via AsyncSniffer com tratamento robusto a frames malformados e reinicialização automática."""
+    """
+    Captura pacotes via AsyncSniffer e os deposita na fila global.
+
+    Melhorias em relação à versão anterior:
+    - TCPSession REMOVIDO: evitava reassembly custoso que inflava o volume
+      de pacotes e causava o erro 'unpack requires a buffer of 1 bytes'.
+    - Reinício automático: se o socket do Scapy falhar (ex.: pacote
+      malformado na libpcap), o sniffer é recriado após 2 segundos.
+    - Rate limiter: descarta pacotes além de _MAX_PACOTES_POR_SEGUNDO para
+      proteger a fila e a UI em redes muito movimentadas.
+    - _processar_pacote envolvido em try/except para que um único pacote
+      corrompido nunca derrube toda a thread.
+    """
 
     erro_ocorrido = pyqtSignal(str)
     sem_pacotes   = pyqtSignal(str)
@@ -115,220 +136,212 @@ class _CapturadorPacotesThread(QThread):
         self.interface = interface
         self._rodando  = False
         self.sniffer   = None
-        # Suprime warnings internos do Scapy (ex: unpack requires a buffer of 1 bytes)
-        import logging
-        logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
+
+        # Rate limiter
+        self._pps_contador   = 0
+        self._pps_reset_ts   = 0.0
 
     def run(self):
         self._rodando = True
-        tentativas = 0
-        max_tentativas = 10
 
-        while self._rodando and tentativas < max_tentativas:
+        while self._rodando:
             try:
-                from scapy.all import AsyncSniffer, TCPSession
+                from scapy.all import AsyncSniffer
 
+                # TCPSession REMOVIDO intencionalmente.
+                # Sem session=TCPSession o Scapy entrega cada pacote IP
+                # individualmente, sem tentar remontar streams TCP.
+                # Isso reduz drasticamente o volume processado e evita o
+                # erro 'unpack requires a buffer of 1 bytes' que o
+                # TCPSession provocava ao receber pacotes fragmentados.
                 self.sniffer = AsyncSniffer(
                     iface=self.interface,
                     prn=self._processar_pacote,
                     store=False,
-                    filter="ip or ip6 or arp",   # Filtro já reduz frames não-IP (STP, LLDP, etc.)
-                    session=TCPSession,
-                    promisc=False,               # Reduz captura de frames de controle, evita malformados
+                    filter="ip or arp",   # ip6 removido: reduz volume
+                    promisc=True,
                 )
                 self.sniffer.start()
-                tentativas = 0  # reset após iniciar com sucesso
 
-                # Loop principal: dorme e verifica se o sniffer ainda está vivo
+                # Loop de monitoramento: verifica a cada segundo se o
+                # sniffer ainda está rodando. Se parar sozinho (ex.: socket
+                # falhou por pacote malformado), sai do loop interno para
+                # que o loop externo recrie o sniffer.
                 while self._rodando:
                     self.sleep(1)
-                    if self.sniffer and not self.sniffer.running:
-                        # Sniffer morreu sozinho (ex: erro interno no Scapy)
-                        self.erro_ocorrido.emit(
-                            "Sniffer parou inesperadamente. Reiniciando..."
-                        )
-                        break  # sai do loop interno para tentar reiniciar
+                    if not getattr(self.sniffer, 'running', False):
+                        if self._rodando:
+                            # Sniffer parou inesperadamente — reinicia
+                            break
 
             except Exception as e:
-                tentativas += 1
-                self.erro_ocorrido.emit(
-                    f"Erro no AsyncSniffer (tentativa {tentativas}/{max_tentativas}): {e}"
-                )
-                if tentativas >= max_tentativas:
-                    self.erro_ocorrido.emit(
-                        "Número máximo de reinicializações atingido. Captura encerrada."
-                    )
-                    break
-                self.sleep(2)  # aguarda antes de tentar novamente
+                if self._rodando:
+                    # Loga mas não emite erro crítico: o loop tentará
+                    # recriar o sniffer após uma pausa.
+                    print(f"[Capturador] Socket falhou: {e} — reiniciando em 2s")
             finally:
-                if self.sniffer and self.sniffer.running:
-                    self.sniffer.stop()
+                self._parar_sniffer_seguro()
 
-    def _processar_pacote(self, packet):
-        """Processa um pacote capturado, ignorando silenciosamente frames malformados."""
-        if not self._rodando:
-            return
+            if self._rodando:
+                # Pausa antes de tentar recriar o socket (2 s)
+                for _ in range(20):
+                    if not self._rodando:
+                        break
+                    time.sleep(0.1)
 
-        # Proteção contra qualquer exceção durante o parsing (frames truncados, malformados)
-        try:
-            dados = {
-                "tamanho":      len(packet),
-                "ip_origem":    None,
-                "ip_destino":   None,
-                "mac_origem":   None,
-                "mac_destino":  None,
-                "protocolo":    "Outro",
-                "porta_origem": None,
-                "porta_destino":None,
-            }
-
-            from scapy.all import Ether, IP, IPv6, TCP, UDP, ARP, DNS, Raw, BOOTP, DHCP
-
-            if packet.haslayer(Ether):
-                dados["mac_origem"]  = packet[Ether].src
-                dados["mac_destino"] = packet[Ether].dst
-
-            if packet.haslayer(IP):
-                dados["ip_origem"]  = packet[IP].src
-                dados["ip_destino"] = packet[IP].dst
-
-                if packet.haslayer(TCP):
-                    dados["protocolo"]     = "TCP"
-                    dados["porta_origem"]  = packet[TCP].sport
-                    dados["porta_destino"] = packet[TCP].dport
-                    flags = packet[TCP].flags
-                    if flags & 0x02:
-                        dados["flags"] = "SYN"
-                    elif flags & 0x01:
-                        dados["flags"] = "FIN"
-                    elif flags & 0x04:
-                        dados["flags"] = "RST"
-
-                elif packet.haslayer(UDP):
-                    dados["protocolo"]     = "UDP"
-                    dados["porta_origem"]  = packet[UDP].sport
-                    dados["porta_destino"] = packet[UDP].dport
-                    if (
-                        dados["porta_origem"] in PORTAS_DHCP
-                        or dados["porta_destino"] in PORTAS_DHCP
-                        or packet.haslayer(DHCP)
-                        or packet.haslayer(BOOTP)
-                    ):
-                        dados["protocolo"] = "DHCP"
-                        dados["dhcp_tipo"] = ""
-
-                        if packet.haslayer(DHCP):
-                            opcoes = packet[DHCP].options or []
-                            mapa_tipos_dhcp = {
-                                1: "discover",
-                                2: "offer",
-                                3: "request",
-                                4: "decline",
-                                5: "ack",
-                                6: "nak",
-                                7: "release",
-                                8: "inform",
-                            }
-                            for opcao in opcoes:
-                                if (
-                                    isinstance(opcao, tuple)
-                                    and len(opcao) >= 2
-                                    and opcao[0] == "message-type"
-                                ):
-                                    valor_opcao = opcao[1]
-                                    if isinstance(valor_opcao, bytes) and valor_opcao:
-                                        valor_opcao = valor_opcao[0]
-                                    if isinstance(valor_opcao, int):
-                                        dados["dhcp_tipo"] = mapa_tipos_dhcp.get(
-                                            valor_opcao, str(valor_opcao)
-                                        )
-                                    else:
-                                        dados["dhcp_tipo"] = str(valor_opcao)
-                                    break
-                        if packet.haslayer(BOOTP):
-                            dados["dhcp_xid"] = int(getattr(packet[BOOTP], "xid", 0) or 0)
-
-                    elif packet.haslayer(DNS):
-                        dados["protocolo"] = "DNS"
-                        if packet[DNS].qr == 0 and packet[DNS].qd:
-                            dados["dominio"] = packet[DNS].qd.qname.decode(
-                                'utf-8', errors='ignore'
-                            ).rstrip('.')
-
-            elif packet.haslayer(IPv6):
-                dados["ip_origem"]  = packet[IPv6].src
-                dados["ip_destino"] = packet[IPv6].dst
-                dados["protocolo"]  = "IPv6"
-
-                if packet.haslayer(TCP):
-                    dados["porta_origem"]  = packet[TCP].sport
-                    dados["porta_destino"] = packet[TCP].dport
-                elif packet.haslayer(UDP):
-                    dados["porta_origem"]  = packet[UDP].sport
-                    dados["porta_destino"] = packet[UDP].dport
-
-            elif packet.haslayer(ARP):
-                dados["protocolo"]  = "ARP"
-                dados["ip_origem"]  = packet[ARP].psrc
-                dados["ip_destino"] = packet[ARP].pdst
-                dados["mac_origem"] = dados["mac_origem"] or packet[ARP].hwsrc
-                dados["arp_op"]     = "request" if packet[ARP].op == 1 else "reply"
-
-            if packet.haslayer(Raw) and (
-                dados.get("porta_destino") in PORTAS_HTTP or
-                dados.get("porta_origem")  in PORTAS_HTTP
-            ):
-                dados["payload"] = packet[Raw].load
-
-            fila_pacotes_global.adicionar(dados)
-
-        except Exception:
-            # Qualquer erro durante o parsing (ex: struct.unpack em buffer vazio) é ignorado silenciosamente
-            pass
-
-    def parar(self):
-        self._rodando = False
+    def _parar_sniffer_seguro(self):
+        """Para o sniffer sem lançar exceção."""
         if self.sniffer:
             try:
                 if getattr(self.sniffer, 'running', False):
                     self.sniffer.stop()
             except Exception:
                 pass
+            self.sniffer = None
+
+    def _processar_pacote(self, packet):
+        """
+        Callback chamado pelo AsyncSniffer para cada pacote capturado.
+
+        O try/except externo garante que um pacote malformado não
+        interrompa a captura. O rate limiter descarta pacotes além do
+        limite configurado para proteger a fila e a UI.
+        """
+        if not self._rodando:
+            return
+
+        # ── Rate limiter ──────────────────────────────────────────────
+        agora = time.time()
+        if agora - self._pps_reset_ts >= 1.0:
+            self._pps_contador  = 0
+            self._pps_reset_ts  = agora
+        self._pps_contador += 1
+        if self._pps_contador > _MAX_PACOTES_POR_SEGUNDO:
+            return   # descarta silenciosamente
+
+        try:
+            self._parsear_e_enfileirar(packet)
+        except Exception:
+            pass   # pacote corrompido: ignora, não interrompe
+
+    def _parsear_e_enfileirar(self, packet):
+        """Extrai campos do pacote e coloca na fila global."""
+        dados = {
+            "tamanho":      len(packet),
+            "ip_origem":    None,
+            "ip_destino":   None,
+            "mac_origem":   None,
+            "mac_destino":  None,
+            "protocolo":    "Outro",
+            "porta_origem": None,
+            "porta_destino":None,
+        }
+
+        from scapy.all import Ether, IP, TCP, UDP, ARP, DNS, Raw, BOOTP, DHCP
+
+        if packet.haslayer(Ether):
+            dados["mac_origem"]  = packet[Ether].src
+            dados["mac_destino"] = packet[Ether].dst
+
+        if packet.haslayer(IP):
+            dados["ip_origem"]  = packet[IP].src
+            dados["ip_destino"] = packet[IP].dst
+
+            if packet.haslayer(TCP):
+                dados["protocolo"]     = "TCP"
+                dados["porta_origem"]  = packet[TCP].sport
+                dados["porta_destino"] = packet[TCP].dport
+                flags = packet[TCP].flags
+                if flags & 0x02:
+                    dados["flags"] = "SYN"
+                elif flags & 0x01:
+                    dados["flags"] = "FIN"
+                elif flags & 0x04:
+                    dados["flags"] = "RST"
+
+            elif packet.haslayer(UDP):
+                dados["protocolo"]     = "UDP"
+                dados["porta_origem"]  = packet[UDP].sport
+                dados["porta_destino"] = packet[UDP].dport
+                if (
+                    dados["porta_origem"] in PORTAS_DHCP
+                    or dados["porta_destino"] in PORTAS_DHCP
+                    or packet.haslayer(DHCP)
+                    or packet.haslayer(BOOTP)
+                ):
+                    dados["protocolo"] = "DHCP"
+                    dados["dhcp_tipo"] = ""
+
+                    if packet.haslayer(DHCP):
+                        opcoes = packet[DHCP].options or []
+                        mapa_tipos_dhcp = {
+                            1: "discover", 2: "offer",  3: "request",
+                            4: "decline",  5: "ack",    6: "nak",
+                            7: "release",  8: "inform",
+                        }
+                        for opcao in opcoes:
+                            if (
+                                isinstance(opcao, tuple)
+                                and len(opcao) >= 2
+                                and opcao[0] == "message-type"
+                            ):
+                                valor_opcao = opcao[1]
+                                if isinstance(valor_opcao, bytes) and valor_opcao:
+                                    valor_opcao = valor_opcao[0]
+                                if isinstance(valor_opcao, int):
+                                    dados["dhcp_tipo"] = mapa_tipos_dhcp.get(
+                                        valor_opcao, str(valor_opcao)
+                                    )
+                                else:
+                                    dados["dhcp_tipo"] = str(valor_opcao)
+                                break
+                    if packet.haslayer(BOOTP):
+                        dados["dhcp_xid"] = int(getattr(packet[BOOTP], "xid", 0) or 0)
+
+                elif packet.haslayer(DNS):
+                    dados["protocolo"] = "DNS"
+                    if packet[DNS].qr == 0 and packet[DNS].qd:
+                        dados["dominio"] = packet[DNS].qd.qname.decode(
+                            'utf-8', errors='ignore'
+                        ).rstrip('.')
+
+        elif packet.haslayer(ARP):
+            dados["protocolo"]  = "ARP"
+            dados["ip_origem"]  = packet[ARP].psrc
+            dados["ip_destino"] = packet[ARP].pdst
+            dados["mac_origem"] = dados["mac_origem"] or packet[ARP].hwsrc
+            dados["arp_op"]     = "request" if packet[ARP].op == 1 else "reply"
+
+        if packet.haslayer(Raw) and (
+            dados.get("porta_destino") in PORTAS_HTTP or
+            dados.get("porta_origem")  in PORTAS_HTTP
+        ):
+            dados["payload"] = packet[Raw].load
+
+        fila_pacotes_global.adicionar(dados)
+
+    def parar(self):
+        self._rodando = False
+        self._parar_sniffer_seguro()
         self.wait(3000)
 
+
 class _DescobrirDispositivosThread(QThread):
-    """
-    Descoberta de hosts via ARP sweep massivo com múltiplas rodadas.
-
-    Estratégia:
-      Rodada 1-3 — srp() com ARP individual para cada IP da sub-rede,
-                   em lotes de 256. Cada rodada cobre apenas os hosts
-                   que ainda não responderam — eficiente em redes com
-                   port-security ou switches gerenciados que filtram
-                   broadcasts tradicionais do arping().
-
-    Por que não usar arping() ou ICMP?
-      • arping() envia 1 broadcast para a sub-rede toda; switches com
-        STP/VLAN isolation podem não repassá-lo a todos os hosts.
-      • ICMP via Ethernet exige ARP prévio para resolver o MAC de destino;
-        sem isso o pacote vai para broadcast e a maioria dos hosts ignora.
-      • srp() com ARP individual por host: cada switch precisa apenas
-        encaminhar para a porta correta — nenhum flooding necessário.
-    """
+    """Descoberta de hosts via ARP sweep."""
 
     dispositivo_encontrado = pyqtSignal(str, str, str)
     varredura_concluida    = pyqtSignal(list)
     progresso_atualizado   = pyqtSignal(str)
     erro_ocorrido          = pyqtSignal(str)
 
-    TIMEOUT_ARP    = 1.8   # timeout padrão ARP (ajustado dinamicamente)
-    TIMEOUT_ICMP   = 1.0   # timeout enxuto para ping paralelo
-    TENTATIVAS     = 3     # rodadas de retry para hosts que não responderam
-    BATCH_ARP      = 512   # padrão cablado; em Wi‑Fi reduzimos
-    MAX_HOSTS      = 4_096 # teto de IPs varridos distribuídos em toda a sub-rede
-    PAUSA_RODADAS  = 0.6   # segundos entre rodadas (dinâmico em Wi‑Fi)
-    WORKERS_ICMP   = 64    # reservado (ICMP L2 já usa cache de MAC)
-    INTER_ARP      = 0.0   # intervalo entre quadros ARP (Wi‑Fi ajusta para >0)
+    TIMEOUT_ARP    = 1.8
+    TIMEOUT_ICMP   = 1.0
+    TENTATIVAS     = 3
+    BATCH_ARP      = 512
+    MAX_HOSTS      = 4_096
+    PAUSA_RODADAS  = 0.6
+    WORKERS_ICMP   = 64
+    INTER_ARP      = 0.0
 
     def __init__(self, interface: str, cidr: str = "", habilitar_ping: bool = True,
                  parametros: dict = None):
@@ -339,9 +352,8 @@ class _DescobrirDispositivosThread(QThread):
         self._dispositivos:    list = []
         self._cache_mac:       dict = {}
         self._ips_sem_mac:     set  = set()
-        self._mac_gateway:     str  = ""   # MAC do gateway (para filtrar proxy ARP)
+        self._mac_gateway:     str  = ""
         self._lock = threading.Lock()
-        # Quando possivel, JanelaPrincipal injeta os parametros prontos.
         self._param_arps = dict(parametros) if parametros else {
             "batch": self.BATCH_ARP,
             "inter": self.INTER_ARP,
@@ -358,8 +370,6 @@ class _DescobrirDispositivosThread(QThread):
         self._eh_wifi = self._param_arps.get("wifi", False)
         self._periodo_timer_ms = self._param_arps.get("timer_ms", 30000)
 
-    # ── Ponto de entrada ─────────────────────────────────────────────
-
     def run(self):
         try:
             rede_cidr = self.cidr or self._detectar_cidr() or self._cidr_por_ip_local()
@@ -374,7 +384,6 @@ class _DescobrirDispositivosThread(QThread):
             self._varrer_arp(rede_cidr)
             self._varrer_icmp(rede_cidr)
 
-            # Expansão só em cabeada; em Wi‑Fi evita flood.
             if not self._eh_wifi:
                 try:
                     rede_obj = ipaddress.ip_network(rede_cidr, strict=False)
@@ -399,14 +408,7 @@ class _DescobrirDispositivosThread(QThread):
         except Exception as erro:
             self.erro_ocorrido.emit(f"Erro na descoberta: {erro}")
 
-    # ── ARP sweep com lotes individuais ──────────────────────────────
-
     def _varrer_arp(self, rede_cidr: str):
-        """
-        Envia ARP Request individual para cada IP da sub-rede usando srp().
-        Hosts que não responderem na rodada 1 são retentados nas próximas,
-        até TENTATIVAS vezes — cobre switchs lentos e hosts sob carga.
-        """
         from scapy.all import ARP, Ether, srp
 
         try:
@@ -429,7 +431,6 @@ class _DescobrirDispositivosThread(QThread):
         )
 
         for rodada in range(1, tentativas + 1):
-            # Apenas os hosts que ainda não responderam
             pendentes = [h for h in todos if h not in self._ips_encontrados]
             if not pendentes:
                 self.progresso_atualizado.emit(
@@ -437,7 +438,6 @@ class _DescobrirDispositivosThread(QThread):
                 )
                 break
 
-            # Verifica se o limite de dispositivos foi atingido
             if len(self._ips_encontrados) >= self._limite_hosts:
                 self.progresso_atualizado.emit(
                     f"Limite de {self._limite_hosts} dispositivos atingido. Varredura interrompida."
@@ -470,29 +470,25 @@ class _DescobrirDispositivosThread(QThread):
                         try:
                             ip_resp  = resp[ARP].psrc
                             mac_resp = resp[ARP].hwsrc
-                            
-                            # Filtro 1: ignorar MACs inválidos ou broadcast (proxy ARP)
+
                             if not mac_resp or mac_resp.lower() in (
                                 "ff:ff:ff:ff:ff:ff",
                                 "00:00:00:00:00:00",
                                 "",
                             ):
                                 continue
-                            
-                            # Filtro 2: detectar MAC do gateway na primeira rodada
-                            # (IP terminado em .1 ou .254 com MAC confiável)
+
                             if not self._mac_gateway:
                                 ip_partes = ip_resp.split(".")
                                 if len(ip_partes) == 4:
                                     ultimo_octeto = int(ip_partes[-1])
                                     if ultimo_octeto in (1, 254):
                                         self._mac_gateway = mac_resp.lower()
-                            
-                            # Filtro 3: ignorar respostas com MAC igual ao gateway (proxy ARP)
+
                             if (self._mac_gateway and
                                 mac_resp.lower() == self._mac_gateway):
                                 continue
-                            
+
                             if self._ip_valido(ip_resp):
                                 self._registrar(ip_resp, mac_resp, "")
                                 encontrados_nesta_rodada += 1
@@ -506,7 +502,6 @@ class _DescobrirDispositivosThread(QThread):
                 if sleep_lote > 0:
                     time.sleep(sleep_lote)
 
-                # Interrompe processamento de lote se limite atingido
                 if len(self._ips_encontrados) >= self._limite_hosts:
                     break
 
@@ -515,7 +510,6 @@ class _DescobrirDispositivosThread(QThread):
                 f"total {len(self._ips_encontrados)}"
             )
 
-            # Verifica novamente após a rodada
             if len(self._ips_encontrados) >= self._limite_hosts:
                 break
 
@@ -526,10 +520,6 @@ class _DescobrirDispositivosThread(QThread):
                 time.sleep(pausa)
 
     def _varrer_icmp(self, rede_cidr: str):
-        """
-        Ping paralelo em nível 2 (Ether/IP/ICMP) somente para hosts com MAC já
-        resolvido. Evita ARP implícito do sr() e elimina broadcasts extras.
-        """
         from scapy.all import IP, ICMP, Ether, srp
 
         if self._param_arps.get("desativar_icmp", False):
@@ -556,7 +546,6 @@ class _DescobrirDispositivosThread(QThread):
             if mac:
                 candidatos.append(ip)
             else:
-                # Evita repetir broadcast infinito em hosts que ignoram ARP
                 self._ips_sem_mac.add(ip)
 
         if not candidatos:
@@ -593,7 +582,6 @@ class _DescobrirDispositivosThread(QThread):
             self.progresso_atualizado.emit(f"ICMP falhou: {e}")
 
     def _resolver_mac_unico(self, ip: str) -> str:
-        """Tenta resolver MAC de um host específico sem inundar a rede."""
         from scapy.all import ARP, Ether, srp1
         try:
             resposta = srp1(
@@ -610,11 +598,6 @@ class _DescobrirDispositivosThread(QThread):
         return ""
 
     def _selecionar_hosts(self, rede: ipaddress.IPv4Network) -> list:
-        """
-        Seleciona até MAX_HOSTS endereços distribuídos uniformemente
-        pela rede inteira, evitando o viés de apenas varrer o início
-        do bloco em sub-redes grandes (/16, /20, etc.).
-        """
         total_hosts = max(0, rede.num_addresses - 2)
         if total_hosts <= 0:
             return []
@@ -631,8 +614,6 @@ class _DescobrirDispositivosThread(QThread):
                 break
         return selecionados
 
-    # ── Registro thread-safe ──────────────────────────────────────────
-
     def _registrar(self, ip: str, mac: str, hostname: str):
         with self._lock:
             if ip in self._ips_encontrados:
@@ -642,8 +623,6 @@ class _DescobrirDispositivosThread(QThread):
                 self._cache_mac[ip] = mac
             self._dispositivos.append((ip, mac, hostname))
         self.dispositivo_encontrado.emit(ip, mac, hostname)
-
-    # ── Utilitários ───────────────────────────────────────────────────
 
     @staticmethod
     def _ip_valido(ip: str) -> bool:
@@ -680,10 +659,9 @@ class _DescobrirDispositivosThread(QThread):
         return f"{'.'.join(p[:3])}.0/24" if len(p) == 4 else ""
 
 
-# ════════════════════════════════════════════════════════════════════════
-# Sinal global thread-safe para resultados pedagógicos
-# (necessário porque QRunnable não pode ter pyqtSignal diretamente)
-# ════════════════════════════════════════════════════════════════════════
+# ============================================================================
+# Sinal global para resultados pedagógicos
+# ============================================================================
 
 class _SinalPedagogico(QObject):
     resultado = pyqtSignal(dict)
@@ -691,19 +669,7 @@ class _SinalPedagogico(QObject):
 _sinal_pedagogico_global = _SinalPedagogico()
 
 
-# ════════════════════════════════════════════════════════════════════════
-# Worker leve para QThreadPool — substitui QThread por evento
-# ════════════════════════════════════════════════════════════════════════
-
 class _WorkerRunnable(QRunnable):
-    """
-    QRunnable para processamento pedagógico no pool de threads global.
-    Muito mais eficiente que criar/destruir um QThread por evento:
-      - Sem overhead de criação/destruição de thread do SO
-      - Pool limitado a N threads simultâneas (sem vazamento)
-      - Auto-delete após execução (setAutoDelete(True))
-    """
-
     def __init__(self, evento: dict, motor):
         super().__init__()
         self.evento = evento
@@ -730,12 +696,12 @@ class _WorkerRunnable(QRunnable):
             print(f"[Worker pedagógico] Erro: {e}")
 
 
-# ════════════════════════════════════════════════════════════════════════
+# ============================================================================
 # Janela principal
-# ════════════════════════════════════════════════════════════════════════
+# ============================================================================
 
 class JanelaPrincipal(QMainWindow):
-    """Janela principal do NetLab Educacional — concorrência corrigida."""
+    """Janela principal do NetLab Educacional."""
 
     def __init__(self):
         super().__init__()
@@ -766,36 +732,26 @@ class JanelaPrincipal(QMainWindow):
         self.fila_eventos_ui: deque = deque(maxlen=500)
         self.eventos_mostrados_recentemente: deque = deque(maxlen=200)
 
-        # ── Pool de threads para processamento pedagógico ─────────────
-        # Substitui a criação de QThread por evento (que causava vazamento).
-        # Máximo de 4 threads simultâneas — suficiente para DPI sem
-        # saturar a CPU em capturas de alto volume.
         self._thread_pool = QThreadPool.globalInstance()
         self._thread_pool.setMaxThreadCount(4)
-        # Conecta o sinal global uma única vez à UI thread
         _sinal_pedagogico_global.resultado.connect(self._finalizar_exibicao_evento)
 
-        # EMA para suavização do KB/s (evita spikes no gráfico)
         self._kb_anterior: float = 0.0
         self._param_arps: dict = {}
         self._limite_hosts: int = _DescobrirDispositivosThread.MAX_HOSTS
         self._eh_wifi: bool = False
         self._periodo_timer_ms: int = 30000
 
-        # ── Timers ────────────────────────────────────────────────────
-        # _consumir_fila: apenas enfileira no analisador + coleta resultados
+        # Timers
         self.timer_consumir = QTimer()
         self.timer_consumir.timeout.connect(self._consumir_fila)
 
-        # Atualização visual a 1 segundo
         self.timer_ui = QTimer()
         self.timer_ui.timeout.connect(self._atualizar_ui_por_segundo)
 
-        # Varredura ARP periódica
         self.timer_descoberta = QTimer()
         self.timer_descoberta.timeout.connect(self._descoberta_periodica)
 
-        # Descarregar eventos pedagógicos a cada 2 segundos
         self.timer_eventos = QTimer()
         self.timer_eventos.timeout.connect(self._descarregar_eventos_ui)
         self.timer_eventos.start(2000)
@@ -806,7 +762,9 @@ class JanelaPrincipal(QMainWindow):
         self._criar_barra_ferramentas()
         self._criar_area_central()
 
-    # ── Configuração da janela ────────────────────────────────────────
+    # --------------------------------------------------------------------
+    # Configuração da janela
+    # --------------------------------------------------------------------
 
     def _configurar_janela(self):
         self.setWindowTitle("NetLab Educacional - Monitor de Rede")
@@ -865,6 +823,11 @@ class JanelaPrincipal(QMainWindow):
         self.lbl_ip.setStyleSheet("color:#2ecc71; font-weight:bold;")
         barra.addWidget(self.lbl_ip)
 
+        btn_diag = QPushButton("🔍 Diagnóstico")
+        btn_diag.setToolTip("Exibe informações de diagnóstico da captura atual")
+        btn_diag.clicked.connect(self._exibir_diagnostico_captura)
+        barra.addWidget(btn_diag)
+
     def _criar_area_central(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -893,7 +856,9 @@ class JanelaPrincipal(QMainWindow):
         b.addPermanentWidget(self.lbl_pacotes)
         b.addPermanentWidget(self.lbl_dados)
 
-    # ── Detecção de interfaces ────────────────────────────────────────
+    # --------------------------------------------------------------------
+    # Detecção de interfaces e CIDR
+    # --------------------------------------------------------------------
 
     def _popular_interfaces(self):
         self.combo_interface.clear()
@@ -974,26 +939,120 @@ class JanelaPrincipal(QMainWindow):
         except Exception:
             return 24
 
-    def _cidr_da_interface(self, desc: str) -> str:
-        ip   = self._mapa_interface_ip.get(desc, "")
-        mask = self._mapa_interface_mascara.get(desc, "")
-        if not ip:
+    def _obter_cidr_via_ipconfig(self, desc_interface: str) -> str:
+        """Fallback definitivo: executa 'ipconfig' e analisa a saída."""
+        try:
+            resultado = subprocess.run(
+                ["ipconfig", "/all"],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='ignore',
+                timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            saida = resultado.stdout
+
+            padrao_adaptador = re.compile(
+                r"(?:Adaptador|Adapter)[^\n]*" + re.escape(desc_interface) + r".*?(?:\r?\n\r?\n|\Z)",
+                re.DOTALL | re.IGNORECASE
+            )
+            bloco = padrao_adaptador.search(saida)
+            if not bloco:
+                return ""
+
+            texto_bloco = bloco.group(0)
+
+            ip_match = re.search(r"Endereço IPv4[.\s]*:\s*([\d.]+)", texto_bloco, re.IGNORECASE)
+            if not ip_match:
+                ip_match = re.search(r"IPv4 Address[.\s]*:\s*([\d.]+)", texto_bloco, re.IGNORECASE)
+            if not ip_match:
+                return ""
+
+            ip = ip_match.group(1)
+
+            mask_match = re.search(r"Máscara de Sub-rede[.\s]*:\s*([\d.]+)", texto_bloco, re.IGNORECASE)
+            if not mask_match:
+                mask_match = re.search(r"Subnet Mask[.\s]*:\s*([\d.]+)", texto_bloco, re.IGNORECASE)
+            if not mask_match:
+                partes = ip.split(".")
+                if len(partes) == 4:
+                    return f"{partes[0]}.{partes[1]}.{partes[2]}.0/24"
+                return ""
+
+            mascara = mask_match.group(1)
+            try:
+                prefixo = sum(bin(int(p)).count("1") for p in mascara.split("."))
+                rede = ipaddress.ip_network(f"{ip}/{prefixo}", strict=False)
+                return str(rede)
+            except Exception:
+                return ""
+        except Exception:
             return ""
-        prefixo = self._mascara_para_prefixo(mask) if mask else 24
-        return f"{ip}/{prefixo}"
+
+    @staticmethod
+    def _detectar_cidr_via_scapy(nome_interface: str) -> str:
+        """
+        CORRIGIDO: era método de instância sem 'self' — causava TypeError.
+        Agora é @staticmethod, pois não precisa de nenhum atributo de instância.
+        """
+        try:
+            from scapy.all import get_if_addr, get_if_netmask
+            ip      = get_if_addr(nome_interface)
+            mascara = get_if_netmask(nome_interface)
+            if ip and mascara and ip != "0.0.0.0":
+                prefixo = sum(bin(int(p)).count("1") for p in mascara.split("."))
+                rede = ipaddress.ip_network(f"{ip}/{prefixo}", strict=False)
+                return str(rede)
+        except Exception:
+            pass
+        return ""
+
+    def _cidr_da_interface(self, desc: str) -> str:
+        """Determina o CIDR da interface selecionada com múltiplos fallbacks."""
+        ip_interface = self._mapa_interface_ip.get(desc, "")
+        mascara      = self._mapa_interface_mascara.get(desc, "")
+
+        # Fallback 1: mapeamento interno
+        if ip_interface and mascara:
+            try:
+                prefixo = self._mascara_para_prefixo(mascara)
+                rede = ipaddress.ip_network(f"{ip_interface}/{prefixo}", strict=False)
+                return str(rede)
+            except Exception:
+                pass
+
+        # Fallback 2: Scapy
+        nome_dispositivo = self._mapa_interface_nome.get(desc, desc)
+        cidr_scapy = self._detectar_cidr_via_scapy(nome_dispositivo)
+        if cidr_scapy:
+            return cidr_scapy
+
+        # Fallback 3: ipconfig
+        cidr_ipconfig = self._obter_cidr_via_ipconfig(desc)
+        if cidr_ipconfig:
+            self._status(f"✅ CIDR obtido via ipconfig: {cidr_ipconfig}")
+            return cidr_ipconfig
+
+        # Fallback 4: /24 estimado
+        if ip_interface:
+            partes = ip_interface.split(".")
+            if len(partes) == 4:
+                rede_base = ".".join(partes[:3]) + ".0/24"
+                self._status(
+                    f"⚠ Máscara não detectada para {desc}. "
+                    f"Usando {rede_base} como estimativa."
+                )
+                return rede_base
+
+        return ""
 
     def _parametros_iface_seguro(self, nome_iface: str) -> dict:
-        """
-        Define limites conservadores para Wi‑Fi e parâmetros normais para cabeada.
-        A topologia é limitada a 30 dispositivos reais locais (com prova de vida via tráfego).
-        Varredura ARP é apenas inicial/leve (sem periódica).
-        Usado antes de iniciar captura e para instanciar a thread de descoberta.
-        """
         nome_lower = (nome_iface or "").lower()
         eh_wifi = any(p in nome_lower for p in ("wi-fi", "wifi", "wireless", "ax", "802.11"))
 
         base = {
-            "limite_hosts": 100,        # Limite para varredura ARP (interno, UI limita a 30)
+            "limite_hosts": 100,
             "desativar_icmp": False,
             "tentativas": _DescobrirDispositivosThread.TENTATIVAS,
             "timeout": _DescobrirDispositivosThread.TIMEOUT_ARP,
@@ -1013,7 +1072,7 @@ class JanelaPrincipal(QMainWindow):
                 "timeout": 2.8,
                 "tentativas": 1,
                 "desativar_icmp": True,
-                "timer_ms": 300000,  # 5 minutos; não inicia automático em Wi‑Fi
+                "timer_ms": 300000,
             })
 
         return base
@@ -1025,7 +1084,9 @@ class JanelaPrincipal(QMainWindow):
             for d in top_dns[:5]
         ]
 
-    # ── Controle de captura ───────────────────────────────────────────
+    # --------------------------------------------------------------------
+    # Controle de captura
+    # --------------------------------------------------------------------
 
     @pyqtSlot()
     def _alternar_captura(self):
@@ -1036,7 +1097,6 @@ class JanelaPrincipal(QMainWindow):
 
     def _validar_pre_captura(self, nome_dispositivo: str):
         try:
-            import ctypes
             if hasattr(ctypes, "windll") and not ctypes.windll.shell32.IsUserAnAdmin():
                 raise PermissionError(
                     "Execute o NetLab como Administrador para capturar pacotes."
@@ -1107,7 +1167,6 @@ class JanelaPrincipal(QMainWindow):
         self._cidr_captura      = self._cidr_da_interface(desc_sel)
         self.painel_topologia.definir_rede_local(self._cidr_captura)
 
-        # Parâmetros seguros conforme tipo de interface
         self._param_arps       = self._parametros_iface_seguro(self._interface_captura)
         self._periodo_timer_ms = self._param_arps.get("timer_ms", 30000)
         self._eh_wifi          = self._param_arps.get("wifi", False)
@@ -1123,7 +1182,6 @@ class JanelaPrincipal(QMainWindow):
         self._bytes_total_anterior = 0
         self._instante_anterior    = time.perf_counter()
 
-        # Inicia thread de análise assíncrona
         self.analisador.iniciar_thread()
 
         try:
@@ -1141,12 +1199,9 @@ class JanelaPrincipal(QMainWindow):
         self.timer_consumir.start(250)
         self.timer_ui.start(1000)
 
-        # Descoberta ARP: totalmente desabilitada (para evitar IPs falsos via proxy ARP)
-        # Apenas descoberta passiva: IPs que realmente gerarem/receberem tráfego
-        self._status(
-            "Captura iniciada. Descoberta passiva ativa (apenas dispositivos com tráfego real)."
-        )
-        # (remover: QTimer.singleShot(3000, self._varredura_unica_leve))
+        self._status("Captura iniciada. Descoberta passiva ativa.")
+        QTimer.singleShot(4000, self._varredura_inicial_segura)
+        QTimer.singleShot(500, self._popular_topologia_via_arp_sistema)
 
         self.em_captura = True
         self.botao_captura.setText("Parar Captura")
@@ -1168,7 +1223,6 @@ class JanelaPrincipal(QMainWindow):
             self.capturador.parar()
             self.capturador = None
 
-        # Para thread de análise e coleta resultados finais
         self.analisador.parar_thread()
         self._consumir_fila()
 
@@ -1186,24 +1240,16 @@ class JanelaPrincipal(QMainWindow):
         botao.style().unpolish(botao)
         botao.style().polish(botao)
 
-    # ── Consumo da fila (UI thread — trabalho MÍNIMO) ─────────────────
-    #
-    # Esta função roda a cada 100 ms na UI thread.
-    # NUNCA deve fazer: parsing de pacotes, commits SQLite ou I/O.
-    # Apenas:
-    #   1. Passa pacotes ao analisador (enfileirar — O(1))
-    #   2. Coleta eventos prontos (coletar_resultados — O(n eventos))
-    #   3. Atualiza topologia (só IPs, sem banco)
-    #   4. Roteia DB para _EscritorBanco (O(1) — sem bloqueio)
+    # --------------------------------------------------------------------
+    # Consumo da fila e UI
+    # --------------------------------------------------------------------
 
     @pyqtSlot()
     def _consumir_fila(self):
-        # 1. Pega todos os pacotes brutos da fila do sniffer
         pacotes = fila_pacotes_global.consumir_todos()
         for dados in pacotes:
             self.analisador.enfileirar(dados)
 
-        # 2. Coleta eventos já analisados pela ThreadAnalisador
         eventos, _ = self.analisador.coletar_resultados()
 
         for evento in eventos:
@@ -1212,20 +1258,13 @@ class JanelaPrincipal(QMainWindow):
             mac_origem = evento.get("mac_origem", "")
             tipo       = evento.get("tipo",       "")
 
-            # Atualiza topologia (operação Qt — rápida, sem I/O)
             if ip_origem:
                 self.painel_topologia.adicionar_dispositivo(ip_origem, mac_origem)
-            # Descoberta passiva: IPs de destino locais também são adicionados
             if ip_destino:
                 self.painel_topologia.adicionar_dispositivo(ip_destino, "")
             if ip_origem and ip_destino:
                 self.painel_topologia.adicionar_conexao(ip_origem, ip_destino)
 
-            # Salva dispositivo no banco em background
-            if ip_origem:
-                pass  # Sem persistência (banco de dados removido)
-
-            # Filtragem e enfileiramento de eventos pedagógicos
             if tipo:
                 if tipo == "NOVO_DISPOSITIVO":
                     if ip_origem:
@@ -1240,15 +1279,9 @@ class JanelaPrincipal(QMainWindow):
                         or f"{evento.get('metodo', '')}:{evento.get('recurso', '')}"
                     )
                     chave = f"{tipo}_{ip_origem}_{_disc}"
-                    
-                    # HTTP/HTTPS: manter todos os eventos para compatibilizar
-                    # com o volume real visto no servidor (sem dedupe por cooldown).
+
                     if tipo in ("HTTP", "HTTPS"):
                         self.fila_eventos_ui.append(evento)
-
-                    # DNS: cooldown por domínio (3s) — evita flood de eventos
-                    # na UI sem perder consultas a domínios distintos.
-                    # Antes: sem cooldown → centenas de eventos/min em redes ativas.
                     elif tipo == "DNS":
                         dominio = evento.get("dominio", "")
                         chave_dns = f"DNS_{ip_origem}_{dominio}"
@@ -1258,10 +1291,6 @@ class JanelaPrincipal(QMainWindow):
                         if self.estado_rede.deve_emitir_evento(chave, cooldown=5):
                             self.fila_eventos_ui.append(evento)
 
-        # 3. Amostragem para banco (1 em cada 5 pacotes — em background)
-        # Banco de dados removido — sem persistência
-
-        # 4. Atualiza snapshot em memória (sem I/O)
         self._snapshot_atual = {
             "total_bytes":       self.analisador.total_bytes,
             "total_pacotes":     self.analisador.total_pacotes,
@@ -1272,13 +1301,10 @@ class JanelaPrincipal(QMainWindow):
             "historias":         self._gerar_historias(),
         }
 
-    # ── Agregação e descarregamento de eventos pedagógicos ────────────
-
     def _agregar_eventos(self, eventos: list) -> list:
         agregados: dict = {}
         resultado: list = []
         for ev in eventos:
-            # HTTP/HTTPS não são agregados: cada requisição deve aparecer.
             if ev.get("tipo") in ("HTTP", "HTTPS"):
                 resultado.append(ev)
                 continue
@@ -1324,8 +1350,6 @@ class JanelaPrincipal(QMainWindow):
             self.eventos_mostrados_recentemente.append(chave_visual)
             self._exibir_evento_pedagogico(ev)
 
-    # ── Atualização da UI a 1 segundo ────────────────────────────────
-
     @pyqtSlot()
     def _atualizar_ui_por_segundo(self):
         snap          = self._snapshot_atual
@@ -1335,16 +1359,12 @@ class JanelaPrincipal(QMainWindow):
         agora   = time.perf_counter()
         delta_t = agora - self._instante_anterior
 
-        # Guarda mínimo de 0.5s para evitar spikes por invocações rápidas
-        # (timer_ui = 1500ms, mas pode ser chamado manualmente em parar_captura)
         if delta_t < 0.5:
             delta_t = max(delta_t, 0.001)
 
         delta_b  = max(0, total_bytes - self._bytes_total_anterior)
         kb_raw   = (delta_b / 1024.0) / delta_t
 
-        # Média Móvel Exponencial (EMA α=0.3) — suaviza spikes sem atrasar demais
-        # α alto → reage rápido; α baixo → mais suave. 0.3 é um bom equilíbrio.
         alpha = 0.3
         kb_por_s = alpha * kb_raw + (1.0 - alpha) * self._kb_anterior
         self._kb_anterior = kb_por_s
@@ -1374,19 +1394,11 @@ class JanelaPrincipal(QMainWindow):
             else f"  Dados: {kb:.1f} KB  "
         )
 
-    # ── Exibição de evento pedagógico ─────────────────────────────────
+    # --------------------------------------------------------------------
+    # Exibição de eventos pedagógicos
+    # --------------------------------------------------------------------
 
     def _exibir_evento_pedagogico(self, evento: dict):
-        """
-        Despacha o processamento pedagógico para o pool de threads global.
-        
-        Antes: criava um QThread + QObject por evento → vazamento de threads,
-        alto consumo de CPU/RAM em capturas longas (centenas de threads ativas).
-        
-        Agora: usa QRunnable no QThreadPool (máx. 4 workers simultâneos).
-        Overhead por evento: ~0 (sem criação/destruição de thread do SO).
-        O resultado chega via _sinal_pedagogico_global.resultado → UI thread.
-        """
         runnable = _WorkerRunnable(evento, self.motor_pedagogico)
         self._thread_pool.start(runnable)
 
@@ -1394,56 +1406,118 @@ class JanelaPrincipal(QMainWindow):
         self.painel_eventos.adicionar_evento(explicacao)
 
     def _finalizar_workers(self):
-        # Aguarda todos os workers do pool terminarem (máx. 3s)
-        # Não há lista de threads para limpar — o pool gerencia tudo.
         self._thread_pool.waitForDone(3000)
 
-    # ── Descoberta periódica de dispositivos ──────────────────────────
+    # --------------------------------------------------------------------
+    # Descoberta de dispositivos
+    # --------------------------------------------------------------------
 
-    def _varredura_unica_leve(self):
-        """
-        Varredura única com parâmetros ultraconservadores ao iniciar captura.
-        Objetivo: descobrir apenas dispositivos muito próximos (ARP)
-        sem gerar falsos positivos massivos.
-        
-        Esta varredura faz apenas UMA rodada, com timeout curto,
-        sem expansão de sub-rede e com limite baixo.
-        """
-        if not self.em_captura:
+    def _varredura_inicial_segura(self):
+        if not self.em_captura or not self._interface_captura:
             return
         if self.descoberta_rodando or (self.descobridor and self.descobridor.isRunning()):
             return
-        if not self._interface_captura:
-            return
 
-        # Parâmetros ultraconservadores
-        param_leve = self._param_arps.copy()
-        param_leve.update({
-            "limite_hosts": 15,        # máximo 15 IPs testados (muito baixo)
-            "tentativas": 1,           # apenas 1 rodada
-            "timeout": 0.5,            # timeout bem curto
-            "batch": 5,                # lote pequeno
-            "desativar_icmp": True,    # sem ping paralelo
-        })
+        parametros_leves = {
+            "limite_hosts":   30,
+            "tentativas":      1,
+            "timeout":        0.8,
+            "batch":           8,
+            "inter":          0.02,
+            "sleep_lote":     0.1,
+            "desativar_icmp": True,
+            "pausa":          1.0,
+            "wifi":           self._eh_wifi,
+            "timer_ms":       60000,
+        }
 
         self.descoberta_rodando = True
-        self._status("Varredura leve: procurando dispositivos próximos...")
+        self._status("🔍 Varredura inicial: descobrindo dispositivos próximos...")
+
         self.descobridor = _DescobrirDispositivosThread(
             interface=self._interface_captura,
             cidr=self._cidr_captura,
-            parametros=param_leve,
+            parametros=parametros_leves,
         )
         self.descobridor.dispositivo_encontrado.connect(self._ao_encontrar_dispositivo)
-        self.descobridor.varredura_concluida.connect(self._ao_concluir_varredura_leve)
+        self.descobridor.varredura_concluida.connect(self._ao_concluir_varredura_inicial)
         self.descobridor.progresso_atualizado.connect(self._status)
-        self.descobridor.erro_ocorrido.connect(self._ao_ocorrer_erro)
+        self.descobridor.erro_ocorrido.connect(self._ao_erro_varredura_silencioso)
         self.descobridor.start()
 
     @pyqtSlot(list)
-    def _ao_concluir_varredura_leve(self, dispositivos: list):
-        """Callback ao finalizar varredura leve — sem ativar descoberta periódica."""
-        self._status(f"Varredura leve concluída — {len(dispositivos)} dispositivo(s) detectado(s).")
+    def _ao_concluir_varredura_inicial(self, dispositivos: list):
+        total = len(dispositivos)
+        self._status(
+            f"✅ Varredura inicial: {total} dispositivo(s) encontrado(s). "
+            f"Captura passiva ativa."
+        )
         self.descoberta_rodando = False
+
+    @pyqtSlot(str)
+    def _ao_erro_varredura_silencioso(self, mensagem: str):
+        self._status(f"⚠ Varredura: {mensagem[:80]}")
+        self.descoberta_rodando = False
+
+    def _popular_topologia_via_arp_sistema(self):
+        entradas = self._obter_tabela_arp_sistema()
+        adicionados = 0
+        for entrada in entradas:
+            ip_arp  = entrada["ip"]
+            mac_arp = entrada["mac"]
+            self.painel_topologia.adicionar_dispositivo_manual(ip_arp, mac_arp)
+            adicionados += 1
+
+        if adicionados:
+            self._status(
+                f"📋 Tabela ARP do sistema: {adicionados} dispositivo(s) "
+                f"importado(s) para a topologia."
+            )
+
+    @staticmethod
+    def _obter_tabela_arp_sistema() -> list:
+        import platform
+        entradas = []
+
+        try:
+            if platform.system() == "Windows":
+                saida = subprocess.check_output(
+                    ["arp", "-a"], text=True, timeout=5,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+                padrao = re.compile(
+                    r'\s+([\d.]+)\s+([\da-f]{2}[-:][\da-f]{2}[-:]'
+                    r'[\da-f]{2}[-:][\da-f]{2}[-:][\da-f]{2}[-:][\da-f]{2})'
+                    r'\s+(\w+)',
+                    re.IGNORECASE
+                )
+            else:
+                saida = subprocess.check_output(
+                    ["ip", "neigh"], text=True, timeout=5
+                )
+                padrao = re.compile(
+                    r'^([\d.]+)\s+dev\s+\S+\s+lladdr\s+'
+                    r'([\da-f:]{17})\s+(\w+)',
+                    re.IGNORECASE | re.MULTILINE
+                )
+
+            for correspondencia in padrao.finditer(saida):
+                ip_arp  = correspondencia.group(1)
+                mac_arp = correspondencia.group(2).replace("-", ":").lower()
+                tipo    = correspondencia.group(3)
+
+                if mac_arp in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"):
+                    continue
+
+                entradas.append({
+                    "ip":   ip_arp,
+                    "mac":  mac_arp,
+                    "tipo": tipo,
+                })
+        except Exception:
+            pass
+
+        return entradas
 
     def _descoberta_periodica(self):
         if not self.em_captura:
@@ -1479,7 +1553,75 @@ class JanelaPrincipal(QMainWindow):
         self._status(f"Varredura concluída — {len(dispositivos)} dispositivo(s) encontrado(s).")
         self.descoberta_rodando = False
 
-    # ── Tratamento de erros ───────────────────────────────────────────
+    # --------------------------------------------------------------------
+    # Diagnóstico
+    # --------------------------------------------------------------------
+
+    def _exibir_diagnostico_captura(self):
+        desc_sel         = self.combo_interface.currentText()
+        nome_dispositivo = self._mapa_interface_nome.get(desc_sel, desc_sel)
+        ip_local         = self._mapa_interface_ip.get(desc_sel, obter_ip_local())
+        mascara          = self._mapa_interface_mascara.get(desc_sel, "Não detectada")
+        cidr             = self._cidr_captura or "Não definido"
+        total_local      = self.painel_topologia.total_dispositivos()
+
+        is_admin = False
+        try:
+            is_admin = ctypes.windll.shell32.IsUserAnAdmin()
+        except Exception:
+            pass
+        status_admin = "✅ Sim" if is_admin else "❌ Não (recomendado)"
+
+        texto = (
+            f"<h3 style='color:#3498DB;'>🔍 Diagnóstico da Captura</h3>"
+            f"<table style='font-size:11px;width:100%;'>"
+            f"<tr><td style='color:#7f8c8d;'>Interface:</td>"
+            f"    <td style='color:#ecf0f1;'>{desc_sel}</td></tr>"
+            f"<tr><td style='color:#7f8c8d;'>Dispositivo:</td>"
+            f"    <td style='color:#ecf0f1;font-family:Consolas;'>{nome_dispositivo}</td></tr>"
+            f"<tr><td style='color:#7f8c8d;'>IP local:</td>"
+            f"    <td style='color:#2ECC71;font-weight:bold;'>{ip_local}</td></tr>"
+            f"<tr><td style='color:#7f8c8d;'>Máscara:</td>"
+            f"    <td style='color:#ecf0f1;'>{mascara}</td></tr>"
+            f"<tr><td style='color:#7f8c8d;'>CIDR detectado:</td>"
+            f"    <td style='color:#F39C12;font-weight:bold;'>{cidr}</td></tr>"
+            f"<tr><td style='color:#7f8c8d;'>Dispositivos locais:</td>"
+            f"    <td style='color:#ecf0f1;'>{total_local}</td></tr>"
+            f"<tr><td style='color:#7f8c8d;'>Modo promíscuo:</td>"
+            f"    <td style='color:#2ECC71;'>Ativo</td></tr>"
+            f"<tr><td style='color:#7f8c8d;'>Rate limit (pkt/s):</td>"
+            f"    <td style='color:#2ECC71;'>{_MAX_PACOTES_POR_SEGUNDO}</td></tr>"
+            f"<tr><td style='color:#7f8c8d;'>Executando como Admin:</td>"
+            f"    <td style='color:#ecf0f1;'>{status_admin}</td></tr>"
+            f"</table>"
+            f"<hr style='border-color:#1e2d40;margin:12px 0;'>"
+            f"<p style='color:#7f8c8d;font-size:10px;'>"
+            f"Se o CIDR estiver incorreto, dispositivos da mesma rede física "
+            f"podem ser classificados como 'Internet'.</p>"
+            f"<p style='color:#e67e22;font-size:10px;margin-top:12px;'>"
+            f"<b>⚠️ Aviso sobre Wi-Fi:</b> No Windows, a captura em modo promíscuo "
+            f"pode não mostrar todo o tráfego da rede sem fio.</p>"
+        )
+
+        dialogo = QDialog(self)
+        dialogo.setWindowTitle("Diagnóstico de Captura")
+        dialogo.setMinimumSize(480, 360)
+        layout = QVBoxLayout(dialogo)
+
+        txt = QTextEdit()
+        txt.setReadOnly(True)
+        txt.setHtml(texto)
+        txt.setStyleSheet("background:#0f1423;border:none;")
+        layout.addWidget(txt)
+
+        botoes = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        botoes.accepted.connect(dialogo.accept)
+        layout.addWidget(botoes)
+        dialogo.exec()
+
+    # --------------------------------------------------------------------
+    # Tratamento de erros e ações gerais
+    # --------------------------------------------------------------------
 
     @pyqtSlot(str)
     def _ao_ocorrer_erro(self, mensagem: str):
@@ -1488,8 +1630,6 @@ class JanelaPrincipal(QMainWindow):
         if self.em_captura:
             self._parar_captura()
         self.descoberta_rodando = False
-
-    # ── Ações gerais ──────────────────────────────────────────────────
 
     def _nova_sessao(self):
         self._finalizar_workers()
@@ -1514,17 +1654,17 @@ class JanelaPrincipal(QMainWindow):
 
     def _exibir_sobre(self):
         QMessageBox.about(
-        self,
-        "Sobre o NetLab Educacional",
-        "<h2>NetLab Educacional V3.0</h2>"
-        "<p>Plataforma educacional para análise de redes locais com captura de pacotes em tempo real e explicações didáticas automatizadas.</p>"
-        "<hr>"
-        "<p><b>TCC — Curso Técnico em Informática</b></p>"
-        "<p><b>Tecnologias:</b> Python · PyQt6 · Scapy · PyQtGraph</p>"
-        "<p><b>Destaques:</b> DPI, detecção de dados sensíveis, identificação via MAC/OUI e monitoramento em tempo real.</p>"
-        "<p><b>Autor:</b> Yuri Gonçalves Pavão</p>"
-        "<p><b>Instagram:</b> @yuri_g0n | <b>GitHub:</b> github.com/yurigonp</p>"
-    )
+            self,
+            "Sobre o NetLab Educacional",
+            "<h2>NetLab Educacional V3.0</h2>"
+            "<p>Plataforma educacional para análise de redes locais com captura de pacotes em tempo real e explicações didáticas automatizadas.</p>"
+            "<hr>"
+            "<p><b>TCC — Curso Técnico em Informática</b></p>"
+            "<p><b>Tecnologias:</b> Python · PyQt6 · Scapy · PyQtGraph</p>"
+            "<p><b>Destaques:</b> DPI, detecção de dados sensíveis, identificação via MAC/OUI e monitoramento em tempo real.</p>"
+            "<p><b>Autor:</b> Yuri Gonçalves Pavão</p>"
+            "<p><b>Instagram:</b> @yuri_g0n | <b>GitHub:</b> github.com/yurigonp</p>"
+        )
 
     def closeEvent(self, evento):
         self._finalizar_workers()
