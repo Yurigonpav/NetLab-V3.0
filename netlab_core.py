@@ -17,9 +17,6 @@ COMPILAÇÃO DA BIBLIOTECA NATIVA
   Linux / macOS:
     gcc -O2 -shared -fPIC -o netlab_core_lib.so netlab_core_lib.c
 
-  Ou use o setup_netlab.py (build via distutils/setuptools):
-    python setup_netlab.py build_ext --inplace
-
 ÍNDICES DE PROTOCOLO
 ─────────────────────
   0=TCP  1=UDP  2=DNS  3=HTTP  4=HTTPS  5=ARP

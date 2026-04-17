@@ -102,8 +102,7 @@ def _carregar_parser_c():
 
     if not caminho.exists():
         print(
-            f"[NetLab] {nome} nao encontrado — usando parser Python.\n"
-            f"         Execute: python compilar_http_parser.py"
+            f"[NetLab] {nome} nao encontrado — usando parser Python."
         )
         return None
 

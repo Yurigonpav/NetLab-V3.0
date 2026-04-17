@@ -490,14 +490,9 @@ class HandlerLabEducacional(BaseHTTPRequestHandler):
         if self.path == "/":
             corpo = self.PAGINA_INICIAL.encode("utf-8")
         elif self.path.startswith("/login"):
-            seguro = (self.__class__._modo_login == "seguro")
-            captcha = ""
-            if seguro:
-                captcha = self._gerar_captcha(ip_cliente)
-            corpo = self._html_login(seguro, captcha, ip_cliente).encode("utf-8")
+            corpo = self._html_login(ip_cliente).encode("utf-8")
         elif self.path.startswith("/signup"):
-            seguro = (self.__class__._modo_login == "seguro")
-            corpo = self._html_signup(seguro).encode("utf-8")
+            corpo = self._html_signup().encode("utf-8")
         elif self.path == "/formulario":
             corpo = self.PAGINA_FORMULARIO.encode("utf-8")
         elif self.path == "/api/dados":
@@ -608,23 +603,10 @@ class HandlerLabEducacional(BaseHTTPRequestHandler):
         self.__class__._captcha_por_ip[ip] = codigo
         return codigo
 
-    def _html_login(self, seguro: bool, captcha: str, ip: str) -> str:
-        badge = " Versão vulnerável — sem limites" if not seguro else " Versão segura — hash + rate limit + CAPTCHA"
-        extra = ""
+    def _html_login(self, ip: str) -> str:
+        badge = " Versão vulnerável — sem limites"
+        extra = "<li>Senha em texto puro, sem bloqueio</li>"
         captcha_input = ""
-        if seguro:
-            extra = (
-                "<li>Hash PBKDF2 + salt</li>"
-                "<li>Rate limit 5 tentativas a cada 30s</li>"
-                "<li>Bloqueio de 60s após estouro</li>"
-                "<li>CAPTCHA obrigatório após 3 falhas</li>"
-            )
-            captcha_input = (
-                f"<label>CAPTCHA (código {captcha})</label>"
-                f"<input type='text' name='captcha' placeholder='Digite {captcha}' required>"
-            )
-        else:
-            extra = "<li>Senha em texto puro, sem bloqueio</li>"
 
         return f"""
 <!DOCTYPE html>
@@ -772,8 +754,8 @@ class HandlerLabEducacional(BaseHTTPRequestHandler):
         """
         return html.encode("utf-8")
 
-    def _html_signup(self, seguro: bool) -> str:
-        badge = " Cadastro vulnerável — senha em texto" if not seguro else " Cadastro seguro — hash + salt"
+    def _html_signup(self) -> str:
+        badge = " Cadastro vulnerável — senha em texto"
         return f"""
 <!DOCTYPE html>
 <html lang="pt-BR">
@@ -1031,10 +1013,6 @@ class PainelServidor(QWidget):
         grp_status = self._criar_grupo_status()
         layout.addWidget(grp_status)
 
-        #  Grupo: Modo de Login 
-        grp_modo = self._criar_grupo_modo_login()
-        layout.addWidget(grp_modo)
-
         #  Grupo: Métricas em Tempo Real 
         grp_metricas = self._criar_grupo_metricas()
         layout.addWidget(grp_metricas)
@@ -1136,33 +1114,6 @@ class PainelServidor(QWidget):
         self.lbl_instrucao.setWordWrap(True)
         layout.addWidget(self.lbl_instrucao)
 
-        return grp
-
-    def _criar_grupo_modo_login(self) -> QGroupBox:
-        grp = QGroupBox(" Cenário de Login para Pentest Externo")
-        grp.setStyleSheet(
-            "QGroupBox { border: 1px solid #1e3a5f; border-radius: 6px; "
-            "margin-top: 2px; font-weight: bold; color: #bdc3c7; }"
-            "QGroupBox::title { subcontrol-origin: margin; padding: 0 3px; }"
-        )
-        layout = QVBoxLayout(grp)
-        layout.setSpacing(6)
-
-        self.grp_radios = QButtonGroup(grp)
-        self.rad_vuln = QRadioButton(" Versão vulnerável — senha em texto, sem limites")
-        self.rad_seg = QRadioButton(" Versão segura — hash + rate limit + bloqueio + CAPTCHA")
-        self.rad_vuln.setChecked(True)
-        self.grp_radios.addButton(self.rad_vuln)
-        self.grp_radios.addButton(self.rad_seg)
-        self.rad_vuln.toggled.connect(lambda checked: checked and self._ao_mudar_modo_login("vulneravel"))
-        self.rad_seg.toggled.connect(lambda checked: checked and self._ao_mudar_modo_login("seguro"))
-
-        desc = QLabel("Use este endereço no Hydra ou outra ferramenta: http://<IP>:<porta>/login")
-        desc.setStyleSheet("color:#7f8c8d; font-size:10px;")
-
-        layout.addWidget(self.rad_vuln)
-        layout.addWidget(self.rad_seg)
-        layout.addWidget(desc)
         return grp
 
     def _criar_grupo_metricas(self) -> QGroupBox:
@@ -1412,12 +1363,6 @@ class PainelServidor(QWidget):
         lbl_tab.setStyleSheet("color: #bdc3c7;")
         cab_tabela.addWidget(lbl_tab)
         cab_tabela.addStretch()
-
-        btn_limpar_tab = QPushButton(" Limpar")
-        btn_limpar_tab.setMaximumWidth(70)
-        btn_limpar_tab.setFixedHeight(24)
-        btn_limpar_tab.clicked.connect(self._limpar_tabela)
-        cab_tabela.addWidget(btn_limpar_tab)
         l_tabela.addLayout(cab_tabela)
 
         self.tabela_reqs = QTableWidget(0, 8)
@@ -1648,9 +1593,6 @@ class PainelServidor(QWidget):
         widget.style().unpolish(widget)
         widget.style().polish(widget)
 
-    def _limpar_tabela(self):
-        self.tabela_reqs.setRowCount(0)
-
     def _atualizar_metricas_por_segundo(self):
         self.lbl_reqs_seg.setText(str(self._contador_segundo))
         self.barra_carga.setValue(min(self._contador_segundo, 50))
@@ -1677,23 +1619,16 @@ class PainelServidor(QWidget):
         self._adicionar_alerta("INFO", "Todos os IPs foram desbloqueados.")
 
     def _ao_mudar_modo_login(self, modo: str):
-        """Alterna entre cenário vulnerável e seguro para testes externos."""
-        self._modo_login = modo
-        # Sincronizar com o handler
-        ativar_protecao = (modo == "seguro")
+        """Mantém modo vulnerável (sem proteções extras)."""
+        self._modo_login = "vulneravel"
         HandlerLabEducacional.configurar_modo(
-            modo,
-            ativar_protecao=ativar_protecao,
-            limite_req=self._limite_atual if ativar_protecao else 0,
-            tempo_bloqueio=self._tempo_atual,
+            "vulneravel",
+            ativar_protecao=False,
+            limite_req=0,
+            tempo_bloqueio=0,
         )
-        # Atualizar check de proteção visual
-        if hasattr(self, "chk_protecao"):
-            self.chk_protecao.setChecked(ativar_protecao)
         if hasattr(self, "lbl_status"):
-            self.lbl_status.setText(
-                " Modo seguro: proteções ligadas" if ativar_protecao else "️ Modo vulnerável: sem limites"
-            )
+            self.lbl_status.setText("️ Modo vulnerável: sem limites")
 
 
 

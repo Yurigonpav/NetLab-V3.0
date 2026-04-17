@@ -325,7 +325,7 @@ netlab-educacional/
 │   ├── painel_topologia.py      # Visualizador de topologia interativo (PyQt6)
 │   ├── painel_trafego.py        # Gráfico KB/s e tabelas de tráfego
 │   ├── painel_eventos.py        # Modo Análise — eventos + Insights
-│   └── painel_login_seguro.py   # Laboratório de autenticação (HTTP vs HTTPS)
+│   └── painel_login.py          # Laboratório de login vulnerável (educacional)
 │
 ├── recursos/
 │   └── estilos/
