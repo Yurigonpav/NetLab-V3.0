@@ -187,8 +187,8 @@ class _CapturadorPacotesThread(QThread):
                 iface=self.interface,
                 prn=self._processar_pacote,
                 store=False,
-                # Inclui ARP para contabilizar descoberta local corretamente.
-                filter="ip or arp",
+                # Inclui IPv6, IPv4 e ARP para captura completa
+                filter="ip or ip6 or arp",
                 session=TCPSession,
                 promisc=True,
             )
@@ -217,7 +217,7 @@ class _CapturadorPacotesThread(QThread):
             "porta_destino":None,
         }
 
-        from scapy.all import Ether, IP, TCP, UDP, ARP, DNS, Raw, BOOTP, DHCP
+        from scapy.all import Ether, IP, IPv6, TCP, UDP, ARP, DNS, Raw, BOOTP, DHCP
 
         if packet.haslayer(Ether):
             dados["mac_origem"]  = packet[Ether].src
@@ -289,6 +289,18 @@ class _CapturadorPacotesThread(QThread):
                         dados["dominio"] = packet[DNS].qd.qname.decode(
                             'utf-8', errors='ignore'
                         ).rstrip('.')
+
+        elif packet.haslayer(IPv6):
+            dados["ip_origem"]  = packet[IPv6].src
+            dados["ip_destino"] = packet[IPv6].dst
+            dados["protocolo"]  = "IPv6"
+
+            if packet.haslayer(TCP):
+                dados["porta_origem"]  = packet[TCP].sport
+                dados["porta_destino"] = packet[TCP].dport
+            elif packet.haslayer(UDP):
+                dados["porta_origem"]  = packet[UDP].sport
+                dados["porta_destino"] = packet[UDP].dport
 
         elif packet.haslayer(ARP):
             dados["protocolo"]  = "ARP"
@@ -377,6 +389,7 @@ class _DescobrirDispositivosThread(QThread):
         self._dispositivos:    list = []
         self._cache_mac:       dict = {}
         self._ips_sem_mac:     set  = set()
+        self._mac_gateway:     str  = ""   # MAC do gateway (para filtrar proxy ARP)
         self._lock = threading.Lock()
         # Quando possivel, JanelaPrincipal injeta os parametros prontos.
         self._param_arps = dict(parametros) if parametros else {
@@ -474,6 +487,13 @@ class _DescobrirDispositivosThread(QThread):
                 )
                 break
 
+            # Verifica se o limite de dispositivos foi atingido
+            if len(self._ips_encontrados) >= self._limite_hosts:
+                self.progresso_atualizado.emit(
+                    f"Limite de {self._limite_hosts} dispositivos atingido. Varredura interrompida."
+                )
+                break
+
             self.progresso_atualizado.emit(
                 f"Rodada ARP {rodada}/{tentativas}: "
                 f"{len(pendentes)} host(s) pendente(s) …"
@@ -500,6 +520,29 @@ class _DescobrirDispositivosThread(QThread):
                         try:
                             ip_resp  = resp[ARP].psrc
                             mac_resp = resp[ARP].hwsrc
+                            
+                            # Filtro 1: ignorar MACs inválidos ou broadcast (proxy ARP)
+                            if not mac_resp or mac_resp.lower() in (
+                                "ff:ff:ff:ff:ff:ff",
+                                "00:00:00:00:00:00",
+                                "",
+                            ):
+                                continue
+                            
+                            # Filtro 2: detectar MAC do gateway na primeira rodada
+                            # (IP terminado em .1 ou .254 com MAC confiável)
+                            if not self._mac_gateway:
+                                ip_partes = ip_resp.split(".")
+                                if len(ip_partes) == 4:
+                                    ultimo_octeto = int(ip_partes[-1])
+                                    if ultimo_octeto in (1, 254):
+                                        self._mac_gateway = mac_resp.lower()
+                            
+                            # Filtro 3: ignorar respostas com MAC igual ao gateway (proxy ARP)
+                            if (self._mac_gateway and
+                                mac_resp.lower() == self._mac_gateway):
+                                continue
+                            
                             if self._ip_valido(ip_resp):
                                 self._registrar(ip_resp, mac_resp, "")
                                 encontrados_nesta_rodada += 1
@@ -513,10 +556,18 @@ class _DescobrirDispositivosThread(QThread):
                 if sleep_lote > 0:
                     time.sleep(sleep_lote)
 
+                # Interrompe processamento de lote se limite atingido
+                if len(self._ips_encontrados) >= self._limite_hosts:
+                    break
+
             self.progresso_atualizado.emit(
                 f"Rodada {rodada}: +{encontrados_nesta_rodada} novo(s) · "
                 f"total {len(self._ips_encontrados)}"
             )
+
+            # Verifica novamente após a rodada
+            if len(self._ips_encontrados) >= self._limite_hosts:
+                break
 
             if rodada < tentativas and encontrados_nesta_rodada == 0:
                 break
@@ -990,37 +1041,38 @@ class JanelaPrincipal(QMainWindow):
     def _parametros_iface_seguro(self, nome_iface: str) -> dict:
         """
         Define limites conservadores para Wi‑Fi e parâmetros normais para cabeada.
+        A topologia é limitada a 30 dispositivos reais locais (com prova de vida via tráfego).
+        Varredura ARP é apenas inicial/leve (sem periódica).
         Usado antes de iniciar captura e para instanciar a thread de descoberta.
         """
         nome_lower = (nome_iface or "").lower()
         eh_wifi = any(p in nome_lower for p in ("wi-fi", "wifi", "wireless", "ax", "802.11"))
 
+        base = {
+            "limite_hosts": 100,        # Limite para varredura ARP (interno, UI limita a 30)
+            "desativar_icmp": False,
+            "tentativas": _DescobrirDispositivosThread.TENTATIVAS,
+            "timeout": _DescobrirDispositivosThread.TIMEOUT_ARP,
+            "pausa": _DescobrirDispositivosThread.PAUSA_RODADAS,
+            "inter": _DescobrirDispositivosThread.INTER_ARP,
+            "sleep_lote": 0.0,
+            "batch": _DescobrirDispositivosThread.BATCH_ARP,
+            "wifi": eh_wifi,
+            "timer_ms": 30000,
+        }
+
         if eh_wifi:
-            return {
+            base.update({
                 "batch": 8,
-                "inter": 0.0,
                 "sleep_lote": 0.25,
                 "pausa": 3.0,
                 "timeout": 2.8,
                 "tentativas": 1,
-                "limite_hosts": 128,
                 "desativar_icmp": True,
-                "wifi": True,
                 "timer_ms": 300000,  # 5 minutos; não inicia automático em Wi‑Fi
-            }
+            })
 
-        return {
-            "batch": _DescobrirDispositivosThread.BATCH_ARP,
-            "inter": _DescobrirDispositivosThread.INTER_ARP,
-            "sleep_lote": 0.0,
-            "pausa": _DescobrirDispositivosThread.PAUSA_RODADAS,
-            "timeout": _DescobrirDispositivosThread.TIMEOUT_ARP,
-            "tentativas": _DescobrirDispositivosThread.TENTATIVAS,
-            "limite_hosts": _DescobrirDispositivosThread.MAX_HOSTS,
-            "desativar_icmp": False,
-            "wifi": False,
-            "timer_ms": 30000,
-        }
+        return base
 
     def _gerar_historias(self) -> list:
         top_dns = self.analisador.obter_top_dns() if hasattr(self.analisador, "obter_top_dns") else []
@@ -1145,16 +1197,13 @@ class JanelaPrincipal(QMainWindow):
 
         self.timer_consumir.start(250)
         self.timer_ui.start(1000)
-        if self._eh_wifi:
-            # Em Wi‑Fi a varredura ativa só deve ser iniciada manualmente para evitar quedas.
-            self._status(
-                "Modo Wi‑Fi: captura passiva + varredura manual (lotes mínimos, limite 128)."
-            )
-        else:
-            self.timer_descoberta.start(self._periodo_timer_ms)
 
-        # Varredura imediata 2 segundos após iniciar (sem esperar 30s)
-        QTimer.singleShot(2000, self._descoberta_periodica)
+        # Descoberta ARP: totalmente desabilitada (para evitar IPs falsos via proxy ARP)
+        # Apenas descoberta passiva: IPs que realmente gerarem/receberem tráfego
+        self._status(
+            "Captura iniciada. Descoberta passiva ativa (apenas dispositivos com tráfego real)."
+        )
+        # (remover: QTimer.singleShot(3000, self._varredura_unica_leve))
 
         self.em_captura = True
         self.botao_captura.setText("Parar Captura")
@@ -1444,6 +1493,51 @@ class JanelaPrincipal(QMainWindow):
         self._thread_pool.waitForDone(3000)
 
     # ── Descoberta periódica de dispositivos ──────────────────────────
+
+    def _varredura_unica_leve(self):
+        """
+        Varredura única com parâmetros ultraconservadores ao iniciar captura.
+        Objetivo: descobrir apenas dispositivos muito próximos (ARP)
+        sem gerar falsos positivos massivos.
+        
+        Esta varredura faz apenas UMA rodada, com timeout curto,
+        sem expansão de sub-rede e com limite baixo.
+        """
+        if not self.em_captura:
+            return
+        if self.descoberta_rodando or (self.descobridor and self.descobridor.isRunning()):
+            return
+        if not self._interface_captura:
+            return
+
+        # Parâmetros ultraconservadores
+        param_leve = self._param_arps.copy()
+        param_leve.update({
+            "limite_hosts": 15,        # máximo 15 IPs testados (muito baixo)
+            "tentativas": 1,           # apenas 1 rodada
+            "timeout": 0.5,            # timeout bem curto
+            "batch": 5,                # lote pequeno
+            "desativar_icmp": True,    # sem ping paralelo
+        })
+
+        self.descoberta_rodando = True
+        self._status("Varredura leve: procurando dispositivos próximos...")
+        self.descobridor = _DescobrirDispositivosThread(
+            interface=self._interface_captura,
+            cidr=self._cidr_captura,
+            parametros=param_leve,
+        )
+        self.descobridor.dispositivo_encontrado.connect(self._ao_encontrar_dispositivo)
+        self.descobridor.varredura_concluida.connect(self._ao_concluir_varredura_leve)
+        self.descobridor.progresso_atualizado.connect(self._status)
+        self.descobridor.erro_ocorrido.connect(self._ao_ocorrer_erro)
+        self.descobridor.start()
+
+    @pyqtSlot(list)
+    def _ao_concluir_varredura_leve(self, dispositivos: list):
+        """Callback ao finalizar varredura leve — sem ativar descoberta periódica."""
+        self._status(f"Varredura leve concluída — {len(dispositivos)} dispositivo(s) detectado(s).")
+        self.descoberta_rodando = False
 
     def _descoberta_periodica(self):
         if not self.em_captura:

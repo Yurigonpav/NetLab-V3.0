@@ -10,6 +10,9 @@
 #   - Múltiplos anéis concêntricos para evitar sobreposição
 
 import math
+import time
+import threading
+import ipaddress
 from typing import Dict, Optional, Tuple
 from collections import defaultdict
 
@@ -164,6 +167,8 @@ class VisualizadorTopologia(QWidget):
     RAIO_BASE       = 16
     RAIO_MIN        = 7
     RAIO_MAX        = 30
+    MAX_DISPOSITIVOS = 50               # Limite realista: apenas dispositivos com tráfego real
+    TIMEOUT_INATIVIDADE = 60          
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -173,6 +178,8 @@ class VisualizadorTopologia(QWidget):
         self._posicoes_mundo: Dict[str, QPointF]  = {}
         self._ip_local = obter_ip_local()
         self._rede_local = None  # ipaddress.ip_network
+        self._ultimo_trafego: Dict[str, float]    = {}  # timestamp da última atividade
+        self._lock_dispositivos = threading.Lock()  # Lock para acesso thread-safe
 
         self._zoom       = 1.0
         self._offset     = QPointF(0, 0)
@@ -197,6 +204,11 @@ class VisualizadorTopologia(QWidget):
         self._timer_layout.setInterval(800)
         self._timer_layout.timeout.connect(self._recalcular_layout)
 
+        # Timer para remover dispositivos inativos a cada minuto
+        self._timer_limpeza = QTimer(self)
+        self._timer_limpeza.timeout.connect(self._remover_inativos)
+        self._timer_limpeza.start(60_000)  # verifica a cada minuto
+
         self.setMouseTracking(True)
         self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
         self.setMinimumSize(500, 350)
@@ -206,29 +218,71 @@ class VisualizadorTopologia(QWidget):
     # ── Interface publica ──────────────────────────────────────────────────
 
     def registrar_origem(self, ip: str, mac: str = "", hostname: str = ""):
+        """Registra uma origem de tráfego na topologia (thread-safe com lock)."""
         if not eh_endereco_valido(ip):
             return
+        
         chave = ip if self._pertence_rede(ip) else "internet"
+        agora = time.time()
 
-        if chave not in self.dispositivos:
+        with self._lock_dispositivos:
+            # Atualiza timestamp para este IP em qualquer caso
+            self._ultimo_trafego[chave] = agora
+
+            # Nó "Internet" não segue limite de 50
+            if chave == "internet":
+                if chave not in self.dispositivos:
+                    self.dispositivos[chave] = {
+                        "ip":       chave,
+                        "mac":      mac or "",
+                        "hostname": "Internet",
+                        "pacotes":  0,
+                        "portas":   set(),
+                    }
+                    if not self._timer_layout.isActive():
+                        self._timer_layout.start()
+                else:
+                    if mac:
+                        self.dispositivos[chave]["mac"] = mac
+                    if hostname:
+                        self.dispositivos[chave]["hostname"] = hostname
+                
+                self.dispositivos[chave]["pacotes"] += 1
+                return
+
+            # IP local já existe: apenas incrementa e atualiza
+            if chave in self.dispositivos:
+                self.dispositivos[chave]["pacotes"] += 1
+                if mac:
+                    self.dispositivos[chave]["mac"] = mac
+                if hostname:
+                    self.dispositivos[chave]["hostname"] = hostname
+                return
+
+            # IP local novo: verificar limite estrito
+            locais_atuais = [k for k in self.dispositivos if k != "internet"]
+            
+            # Se limite atingido, remove menos ativo
+            if len(locais_atuais) >= self.MAX_DISPOSITIVOS:
+                menos_ativo = min(
+                    locais_atuais,
+                    key=lambda k: self.dispositivos[k]["pacotes"]
+                )
+                del self.dispositivos[menos_ativo]
+                self._posicoes_mundo.pop(menos_ativo, None)
+                self._ultimo_trafego.pop(menos_ativo, None)
+
+            # Adiciona novo dispositivo
             self.dispositivos[chave] = {
                 "ip":       chave,
-                "mac":      mac,
-                "hostname": hostname if chave != "internet" else "Internet",
-                "pacotes":  0,
+                "mac":      mac or "",
+                "hostname": hostname or "",
+                "pacotes":  1,
                 "portas":   set(),
             }
-            # Agenda recalculo de layout com debounce — evita chamar
-            # _recalcular_layout centenas de vezes por segundo em capturas pesadas.
+            
             if not self._timer_layout.isActive():
                 self._timer_layout.start()
-        else:
-            if mac and chave != "internet":
-                self.dispositivos[chave]["mac"] = mac
-            if hostname and chave != "internet":
-                self.dispositivos[chave]["hostname"] = hostname
-
-        self.dispositivos[chave]["pacotes"] += 1
 
     def registrar_conexao(self, ip_origem: str, ip_destino: str,
                           porta_origem: int = 0, porta_destino: int = 0):
@@ -256,9 +310,47 @@ class VisualizadorTopologia(QWidget):
         self.dispositivos.clear()
         self.contagem_conexoes.clear()
         self._posicoes_mundo.clear()
+        self._ultimo_trafego.clear()
         self._no_selecionado = None
         self._no_hover = None
         self.update()
+
+    # ── Gerenciamento de dispositivos (expiração e limite prático) ────────
+
+    def _obter_dispositivos_locais(self) -> list:
+        """Retorna lista de IPs locais (exclui 'internet')."""
+        return [k for k in self.dispositivos if k != "internet"]
+
+    def _remover_menos_ativo(self):
+        """Remove o dispositivo local com menor contagem de pacotes."""
+        locais = self._obter_dispositivos_locais()
+        if not locais:
+            return
+        # Encontra o IP com menor número de pacotes
+        menos_ativo = min(locais, key=lambda ip: self.dispositivos[ip]["pacotes"])
+        del self.dispositivos[menos_ativo]
+        self._posicoes_mundo.pop(menos_ativo, None)
+        self._ultimo_trafego.pop(menos_ativo, None)
+
+    def _remover_inativos(self):
+        """Remove dispositivos sem tráfego há mais de 5 minutos."""
+        agora = time.time()
+        inativos = [
+            ip for ip, ts in self._ultimo_trafego.items()
+            if ip != "internet" and (agora - ts) > self.TIMEOUT_INATIVIDADE
+        ]
+        if not inativos:
+            return
+        
+        for ip in inativos:
+            if ip in self.dispositivos:
+                del self.dispositivos[ip]
+            self._posicoes_mundo.pop(ip, None)
+            del self._ultimo_trafego[ip]
+        
+        # Recalcula layout se removeu algo
+        if not self._timer_layout.isActive():
+            self._timer_layout.start()
 
     # ── Zoom / Pan ─────────────────────────────────────────────────────────
 
@@ -322,14 +414,21 @@ class VisualizadorTopologia(QWidget):
             self._rede_local = None
 
     def _pertence_rede(self, ip: str) -> bool:
-        """Exibe individualmente qualquer IP privado RFC1918 (10.x, 172.16-31.x, 192.168.x)."""
+        """
+        Verifica se um IP pertence à rede local exata (sub-rede da interface).
+        Qualquer IP fora da sub-rede é tratado como "internet".
+        """
         if not ip or not eh_endereco_valido(ip):
             return False
-        try:
-            import ipaddress
-            return ipaddress.ip_address(ip).is_private
-        except Exception:
+        
+        # Se nenhuma rede foi definida, usa fallback (eh_ip_local)
+        if self._rede_local is None:
             return eh_ip_local(ip)
+        
+        try:
+            return ipaddress.ip_address(ip) in self._rede_local
+        except Exception:
+            return False
 
     # ── Desenho ────────────────────────────────────────────────────────────
 
