@@ -604,9 +604,11 @@ class HandlerLabEducacional(BaseHTTPRequestHandler):
         return codigo
 
     def _html_login(self, ip: str) -> str:
-        badge = " Versão vulnerável — sem limites"
-        extra = "<li>Senha em texto puro, sem bloqueio</li>"
-        captcha_input = ""
+        # CORREÇÃO: define a variável 'seguro' baseada no modo atual
+        seguro = (self.__class__._modo_login == "seguro")
+        badge = "🔒 Versão segura — com limites" if seguro else "⚠️ Versão vulnerável — sem limites"
+        extra = "<li>Senha com hash PBKDF2, rate limiting, CAPTCHA</li>" if seguro else "<li>Senha em texto puro, sem bloqueio</li>"
+        captcha_input = '<input type="text" name="captcha" placeholder="CAPTCHA">' if seguro else ""
 
         return f"""
 <!DOCTYPE html>
@@ -755,7 +757,9 @@ class HandlerLabEducacional(BaseHTTPRequestHandler):
         return html.encode("utf-8")
 
     def _html_signup(self) -> str:
-        badge = " Cadastro vulnerável — senha em texto"
+        # CORREÇÃO: define a variável 'seguro' baseada no modo atual
+        seguro = (self.__class__._modo_login == "seguro")
+        badge = "🔒 Cadastro seguro — senha com hash" if seguro else "⚠️ Cadastro vulnerável — senha em texto"
         return f"""
 <!DOCTYPE html>
 <html lang="pt-BR">
@@ -1619,22 +1623,25 @@ class PainelServidor(QWidget):
         self._adicionar_alerta("INFO", "Todos os IPs foram desbloqueados.")
 
     def _ao_mudar_modo_login(self, modo: str):
-        """Mantém modo vulnerável (sem proteções extras)."""
-        self._modo_login = "vulneravel"
-        HandlerLabEducacional.configurar_modo(
-            "vulneravel",
-            ativar_protecao=False,
-            limite_req=0,
-            tempo_bloqueio=0,
-        )
-        if hasattr(self, "lbl_status"):
-            self.lbl_status.setText("️ Modo vulnerável: sem limites")
-
-
-
-
-
-
-
-
-
+        """Ajusta o modo de login (vulnerável ou seguro) dinamicamente."""
+        # CORREÇÃO: usa o parâmetro 'modo' em vez de forçar 'vulneravel'
+        self._modo_login = modo
+        # Se for modo seguro, ativa proteção e limites; senão, desativa
+        if modo == "seguro":
+            HandlerLabEducacional.configurar_modo(
+                "seguro",
+                ativar_protecao=True,
+                limite_req=10,          # pode ajustar conforme desejado
+                tempo_bloqueio=30,
+            )
+            if hasattr(self, "lbl_status"):
+                self.lbl_status.setText("🔒 Modo seguro: com limites e hash")
+        else:
+            HandlerLabEducacional.configurar_modo(
+                "vulneravel",
+                ativar_protecao=False,
+                limite_req=0,
+                tempo_bloqueio=0,
+            )
+            if hasattr(self, "lbl_status"):
+                self.lbl_status.setText("⚠️ Modo vulnerável: sem limites")

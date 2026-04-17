@@ -105,7 +105,7 @@ def obter_interfaces_disponiveis() -> list:
 # ════════════════════════════════════════════════════════════════════════
 
 class _CapturadorPacotesThread(QThread):
-    """Captura pacotes via AsyncSniffer e os deposita na fila global."""
+    """Captura pacotes via AsyncSniffer com tratamento robusto a frames malformados e reinicialização automática."""
 
     erro_ocorrido = pyqtSignal(str)
     sem_pacotes   = pyqtSignal(str)
@@ -115,145 +115,176 @@ class _CapturadorPacotesThread(QThread):
         self.interface = interface
         self._rodando  = False
         self.sniffer   = None
+        # Suprime warnings internos do Scapy (ex: unpack requires a buffer of 1 bytes)
+        import logging
+        logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 
     def run(self):
         self._rodando = True
-        try:
-            from scapy.all import AsyncSniffer, TCPSession
+        tentativas = 0
+        max_tentativas = 10
 
-            self.sniffer = AsyncSniffer(
-                iface=self.interface,
-                prn=self._processar_pacote,
-                store=False,
-                # Inclui IPv6, IPv4 e ARP para captura completa
-                filter="ip or ip6 or arp",
-                session=TCPSession,
-                promisc=True,
-            )
-            self.sniffer.start()
-            while self._rodando:
-                self.sleep(1)
+        while self._rodando and tentativas < max_tentativas:
+            try:
+                from scapy.all import AsyncSniffer, TCPSession
 
-        except Exception as e:
-            self.erro_ocorrido.emit(f"Erro no AsyncSniffer: {e}")
-        finally:
-            if self.sniffer and self.sniffer.running:
-                self.sniffer.stop()
+                self.sniffer = AsyncSniffer(
+                    iface=self.interface,
+                    prn=self._processar_pacote,
+                    store=False,
+                    filter="ip or ip6 or arp",   # Filtro já reduz frames não-IP (STP, LLDP, etc.)
+                    session=TCPSession,
+                    promisc=False,               # Reduz captura de frames de controle, evita malformados
+                )
+                self.sniffer.start()
+                tentativas = 0  # reset após iniciar com sucesso
+
+                # Loop principal: dorme e verifica se o sniffer ainda está vivo
+                while self._rodando:
+                    self.sleep(1)
+                    if self.sniffer and not self.sniffer.running:
+                        # Sniffer morreu sozinho (ex: erro interno no Scapy)
+                        self.erro_ocorrido.emit(
+                            "Sniffer parou inesperadamente. Reiniciando..."
+                        )
+                        break  # sai do loop interno para tentar reiniciar
+
+            except Exception as e:
+                tentativas += 1
+                self.erro_ocorrido.emit(
+                    f"Erro no AsyncSniffer (tentativa {tentativas}/{max_tentativas}): {e}"
+                )
+                if tentativas >= max_tentativas:
+                    self.erro_ocorrido.emit(
+                        "Número máximo de reinicializações atingido. Captura encerrada."
+                    )
+                    break
+                self.sleep(2)  # aguarda antes de tentar novamente
+            finally:
+                if self.sniffer and self.sniffer.running:
+                    self.sniffer.stop()
 
     def _processar_pacote(self, packet):
+        """Processa um pacote capturado, ignorando silenciosamente frames malformados."""
         if not self._rodando:
             return
 
-        dados = {
-            "tamanho":      len(packet),
-            "ip_origem":    None,
-            "ip_destino":   None,
-            "mac_origem":   None,
-            "mac_destino":  None,
-            "protocolo":    "Outro",
-            "porta_origem": None,
-            "porta_destino":None,
-        }
+        # Proteção contra qualquer exceção durante o parsing (frames truncados, malformados)
+        try:
+            dados = {
+                "tamanho":      len(packet),
+                "ip_origem":    None,
+                "ip_destino":   None,
+                "mac_origem":   None,
+                "mac_destino":  None,
+                "protocolo":    "Outro",
+                "porta_origem": None,
+                "porta_destino":None,
+            }
 
-        from scapy.all import Ether, IP, IPv6, TCP, UDP, ARP, DNS, Raw, BOOTP, DHCP
+            from scapy.all import Ether, IP, IPv6, TCP, UDP, ARP, DNS, Raw, BOOTP, DHCP
 
-        if packet.haslayer(Ether):
-            dados["mac_origem"]  = packet[Ether].src
-            dados["mac_destino"] = packet[Ether].dst
+            if packet.haslayer(Ether):
+                dados["mac_origem"]  = packet[Ether].src
+                dados["mac_destino"] = packet[Ether].dst
 
-        if packet.haslayer(IP):
-            dados["ip_origem"]  = packet[IP].src
-            dados["ip_destino"] = packet[IP].dst
+            if packet.haslayer(IP):
+                dados["ip_origem"]  = packet[IP].src
+                dados["ip_destino"] = packet[IP].dst
 
-            if packet.haslayer(TCP):
-                dados["protocolo"]     = "TCP"
-                dados["porta_origem"]  = packet[TCP].sport
-                dados["porta_destino"] = packet[TCP].dport
-                flags = packet[TCP].flags
-                if flags & 0x02:
-                    dados["flags"] = "SYN"
-                elif flags & 0x01:
-                    dados["flags"] = "FIN"
-                elif flags & 0x04:
-                    dados["flags"] = "RST"
+                if packet.haslayer(TCP):
+                    dados["protocolo"]     = "TCP"
+                    dados["porta_origem"]  = packet[TCP].sport
+                    dados["porta_destino"] = packet[TCP].dport
+                    flags = packet[TCP].flags
+                    if flags & 0x02:
+                        dados["flags"] = "SYN"
+                    elif flags & 0x01:
+                        dados["flags"] = "FIN"
+                    elif flags & 0x04:
+                        dados["flags"] = "RST"
 
-            elif packet.haslayer(UDP):
-                dados["protocolo"]     = "UDP"
-                dados["porta_origem"]  = packet[UDP].sport
-                dados["porta_destino"] = packet[UDP].dport
-                if (
-                    dados["porta_origem"] in PORTAS_DHCP
-                    or dados["porta_destino"] in PORTAS_DHCP
-                    or packet.haslayer(DHCP)
-                    or packet.haslayer(BOOTP)
-                ):
-                    dados["protocolo"] = "DHCP"
-                    dados["dhcp_tipo"] = ""
+                elif packet.haslayer(UDP):
+                    dados["protocolo"]     = "UDP"
+                    dados["porta_origem"]  = packet[UDP].sport
+                    dados["porta_destino"] = packet[UDP].dport
+                    if (
+                        dados["porta_origem"] in PORTAS_DHCP
+                        or dados["porta_destino"] in PORTAS_DHCP
+                        or packet.haslayer(DHCP)
+                        or packet.haslayer(BOOTP)
+                    ):
+                        dados["protocolo"] = "DHCP"
+                        dados["dhcp_tipo"] = ""
 
-                    if packet.haslayer(DHCP):
-                        opcoes = packet[DHCP].options or []
-                        mapa_tipos_dhcp = {
-                            1: "discover",
-                            2: "offer",
-                            3: "request",
-                            4: "decline",
-                            5: "ack",
-                            6: "nak",
-                            7: "release",
-                            8: "inform",
-                        }
-                        for opcao in opcoes:
-                            if (
-                                isinstance(opcao, tuple)
-                                and len(opcao) >= 2
-                                and opcao[0] == "message-type"
-                            ):
-                                valor_opcao = opcao[1]
-                                if isinstance(valor_opcao, bytes) and valor_opcao:
-                                    valor_opcao = valor_opcao[0]
-                                if isinstance(valor_opcao, int):
-                                    dados["dhcp_tipo"] = mapa_tipos_dhcp.get(
-                                        valor_opcao, str(valor_opcao)
-                                    )
-                                else:
-                                    dados["dhcp_tipo"] = str(valor_opcao)
-                                break
-                    if packet.haslayer(BOOTP):
-                        dados["dhcp_xid"] = int(getattr(packet[BOOTP], "xid", 0) or 0)
+                        if packet.haslayer(DHCP):
+                            opcoes = packet[DHCP].options or []
+                            mapa_tipos_dhcp = {
+                                1: "discover",
+                                2: "offer",
+                                3: "request",
+                                4: "decline",
+                                5: "ack",
+                                6: "nak",
+                                7: "release",
+                                8: "inform",
+                            }
+                            for opcao in opcoes:
+                                if (
+                                    isinstance(opcao, tuple)
+                                    and len(opcao) >= 2
+                                    and opcao[0] == "message-type"
+                                ):
+                                    valor_opcao = opcao[1]
+                                    if isinstance(valor_opcao, bytes) and valor_opcao:
+                                        valor_opcao = valor_opcao[0]
+                                    if isinstance(valor_opcao, int):
+                                        dados["dhcp_tipo"] = mapa_tipos_dhcp.get(
+                                            valor_opcao, str(valor_opcao)
+                                        )
+                                    else:
+                                        dados["dhcp_tipo"] = str(valor_opcao)
+                                    break
+                        if packet.haslayer(BOOTP):
+                            dados["dhcp_xid"] = int(getattr(packet[BOOTP], "xid", 0) or 0)
 
-                elif packet.haslayer(DNS):
-                    dados["protocolo"] = "DNS"
-                    if packet[DNS].qr == 0 and packet[DNS].qd:
-                        dados["dominio"] = packet[DNS].qd.qname.decode(
-                            'utf-8', errors='ignore'
-                        ).rstrip('.')
+                    elif packet.haslayer(DNS):
+                        dados["protocolo"] = "DNS"
+                        if packet[DNS].qr == 0 and packet[DNS].qd:
+                            dados["dominio"] = packet[DNS].qd.qname.decode(
+                                'utf-8', errors='ignore'
+                            ).rstrip('.')
 
-        elif packet.haslayer(IPv6):
-            dados["ip_origem"]  = packet[IPv6].src
-            dados["ip_destino"] = packet[IPv6].dst
-            dados["protocolo"]  = "IPv6"
+            elif packet.haslayer(IPv6):
+                dados["ip_origem"]  = packet[IPv6].src
+                dados["ip_destino"] = packet[IPv6].dst
+                dados["protocolo"]  = "IPv6"
 
-            if packet.haslayer(TCP):
-                dados["porta_origem"]  = packet[TCP].sport
-                dados["porta_destino"] = packet[TCP].dport
-            elif packet.haslayer(UDP):
-                dados["porta_origem"]  = packet[UDP].sport
-                dados["porta_destino"] = packet[UDP].dport
+                if packet.haslayer(TCP):
+                    dados["porta_origem"]  = packet[TCP].sport
+                    dados["porta_destino"] = packet[TCP].dport
+                elif packet.haslayer(UDP):
+                    dados["porta_origem"]  = packet[UDP].sport
+                    dados["porta_destino"] = packet[UDP].dport
 
-        elif packet.haslayer(ARP):
-            dados["protocolo"]  = "ARP"
-            dados["ip_origem"]  = packet[ARP].psrc
-            dados["ip_destino"] = packet[ARP].pdst
-            dados["mac_origem"] = dados["mac_origem"] or packet[ARP].hwsrc
-            dados["arp_op"]     = "request" if packet[ARP].op == 1 else "reply"
+            elif packet.haslayer(ARP):
+                dados["protocolo"]  = "ARP"
+                dados["ip_origem"]  = packet[ARP].psrc
+                dados["ip_destino"] = packet[ARP].pdst
+                dados["mac_origem"] = dados["mac_origem"] or packet[ARP].hwsrc
+                dados["arp_op"]     = "request" if packet[ARP].op == 1 else "reply"
 
-        if packet.haslayer(Raw) and (
-            dados.get("porta_destino") in PORTAS_HTTP or
-            dados.get("porta_origem")  in PORTAS_HTTP
-        ):
-            dados["payload"] = packet[Raw].load
+            if packet.haslayer(Raw) and (
+                dados.get("porta_destino") in PORTAS_HTTP or
+                dados.get("porta_origem")  in PORTAS_HTTP
+            ):
+                dados["payload"] = packet[Raw].load
 
-        fila_pacotes_global.adicionar(dados)
+            fila_pacotes_global.adicionar(dados)
+
+        except Exception:
+            # Qualquer erro durante o parsing (ex: struct.unpack em buffer vazio) é ignorado silenciosamente
+            pass
 
     def parar(self):
         self._rodando = False
