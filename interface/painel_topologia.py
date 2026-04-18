@@ -8,6 +8,11 @@
 #   - Tamanho dos nós dinâmico por volume de tráfego
 #   - Destaque de conexões ao selecionar um nó
 #   - Múltiplos anéis concêntricos para evitar sobreposição
+#
+# PATCHES APLICADOS:
+#   - registrar_origem exige MAC válido (FIX-A)
+#   - Status de confiança CONFIRMADO (ARP) vs OBSERVADO (sniffer) (FIX-B)
+#   - registrar_conexao não cria nós implicitamente (FIX-C)
 
 import math
 import time
@@ -26,9 +31,6 @@ from PyQt6.QtGui import (
     QRadialGradient, QCursor, QPainterPath, QFontMetrics
 )
 from utils.rede import obter_ip_local, eh_endereco_valido
-
-
-# ── Helpers de endereço ───────────────────────────────────────────────────────
 
 
 # ── Painel de detalhes do dispositivo ────────────────────────────────────────
@@ -92,6 +94,7 @@ class PainelDetalhes(QFrame):
             ("pacotes",  "Trafego"),
             ("portas",   "Portas"),
             ("status",   "Status"),
+            ("confianca","Confiança"),   # novo campo do patch
         ]
         for chave, rotulo in campos_def:
             linha = QHBoxLayout()
@@ -145,6 +148,15 @@ class PainelDetalhes(QFrame):
             "color: #2ecc71; font-size:10px;" if pacotes > 0
             else "color: #95a5a6; font-size:10px;"
         )
+
+        # Exibe confiança (CONFIRMADO / OBSERVADO)
+        conf = dados.get("confianca", "OBSERVADO")
+        self._campos["confianca"].setText(conf)
+        if conf == "CONFIRMADO":
+            self._campos["confianca"].setStyleSheet("color: #2ecc71; font-size:10px;")
+        else:
+            self._campos["confianca"].setStyleSheet("color: #f39c12; font-size:10px;")
+
         self.adjustSize()
         self.show()
 
@@ -168,7 +180,14 @@ class VisualizadorTopologia(QWidget):
     RAIO_MIN        = 7
     RAIO_MAX        = 30
     MAX_DISPOSITIVOS = 50               # Limite realista: apenas dispositivos com tráfego real
-    TIMEOUT_INATIVIDADE = 3600          
+    TIMEOUT_INATIVIDADE = 120
+
+    # Conjunto de MACs inválidos que nunca representam um host real (PATCH)
+    _MACS_INVALIDOS = frozenset({
+        "ff:ff:ff:ff:ff:ff",  # broadcast
+        "00:00:00:00:00:00",  # nulo
+        "",
+    })
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -217,53 +236,88 @@ class VisualizadorTopologia(QWidget):
 
     # ── Interface publica ──────────────────────────────────────────────────
 
-    def registrar_origem(self, ip: str, mac: str = "", hostname: str = ""):
-        """Registra uma origem de tráfego na topologia (thread-safe com lock)."""
+    def _mac_e_valido(self, mac: str) -> bool:
+        """
+        Verifica se o MAC representa um host real.
+        Rejeita broadcast, nulo e strings vazias.
+        """
+        if not mac or mac.lower() in self._MACS_INVALIDOS:
+            return False
+        # MAC deve ter pelo menos 11 chars (formato xx:xx:xx:xx:xx:xx)
+        return len(mac.replace(":", "").replace("-", "")) == 12
+
+    def registrar_origem(self, ip: str, mac: str = "", hostname: str = "",
+                         confirmado_por_arp: bool = False):
+        """
+        Registra uma origem de tráfego na topologia.
+
+        REGRA FUNDAMENTAL:
+          • Sem MAC válido → dispositivo NÃO é criado.
+          • ip_destino nunca deve chamar este método.
+
+        Parâmetros:
+            ip: endereço IP de origem (obrigatório)
+            mac: endereço MAC de origem (obrigatório para criar nó)
+            hostname: nome do host (opcional)
+            confirmado_por_arp: True quando a fonte é ARP reply (mais confiável)
+        """
         if not eh_endereco_valido(ip):
             return
-        
+
+        # [FIX-A] Segunda barreira: MAC obrigatório para criar ou atualizar nó.
+        #         Sem MAC não há evidência de camada 2 — dispositivo ignorado.
+        if not self._mac_e_valido(mac):
+            # Exceção: se o nó JÁ existe (descoberto via ARP antes), apenas
+            # incrementa o contador de pacotes sem exigir MAC novamente.
+            chave = ip if self._pertence_rede(ip) else "internet"
+            with self._lock_dispositivos:
+                if chave in self.dispositivos:
+                    self.dispositivos[chave]["pacotes"] += 1
+                    self._ultimo_trafego[chave] = time.time()
+            return
+
         chave = ip if self._pertence_rede(ip) else "internet"
         agora = time.time()
 
+        # [FIX-B] Status de confiança: ARP reply > sniffer passivo
+        status_confianca = "CONFIRMADO" if confirmado_por_arp else "OBSERVADO"
+
         with self._lock_dispositivos:
-            # Atualiza timestamp para este IP em qualquer caso
             self._ultimo_trafego[chave] = agora
 
-            # Nó "Internet" não segue limite de 50
+            # Nó "Internet" não segue limite de 50 e não exige MAC
             if chave == "internet":
                 if chave not in self.dispositivos:
                     self.dispositivos[chave] = {
-                        "ip":       chave,
-                        "mac":      mac or "",
-                        "hostname": "Internet",
-                        "pacotes":  0,
-                        "portas":   set(),
+                        "ip":         chave,
+                        "mac":        "",
+                        "hostname":   "Internet",
+                        "pacotes":    0,
+                        "portas":     set(),
+                        "confianca":  "CONFIRMADO",
                     }
                     if not self._timer_layout.isActive():
                         self._timer_layout.start()
-                else:
-                    if mac:
-                        self.dispositivos[chave]["mac"] = mac
-                    if hostname:
-                        self.dispositivos[chave]["hostname"] = hostname
-                
                 self.dispositivos[chave]["pacotes"] += 1
                 return
 
-            # IP local já existe: apenas incrementa e atualiza
+            # Nó local já existe → atualiza sem recriar
             if chave in self.dispositivos:
                 self.dispositivos[chave]["pacotes"] += 1
                 if mac:
                     self.dispositivos[chave]["mac"] = mac
                 if hostname:
                     self.dispositivos[chave]["hostname"] = hostname
+                # Promove para CONFIRMADO se veio de ARP
+                if confirmado_por_arp:
+                    self.dispositivos[chave]["confianca"] = "CONFIRMADO"
                 return
 
-            # IP local novo: verificar limite estrito
+            # Nó local novo → verifica limite e cria
             locais_atuais = [k for k in self.dispositivos if k != "internet"]
-            
-            # Se limite atingido, remove menos ativo
+
             if len(locais_atuais) >= self.MAX_DISPOSITIVOS:
+                # Remove o menos ativo (menor contador de pacotes)
                 menos_ativo = min(
                     locais_atuais,
                     key=lambda k: self.dispositivos[k]["pacotes"]
@@ -272,39 +326,60 @@ class VisualizadorTopologia(QWidget):
                 self._posicoes_mundo.pop(menos_ativo, None)
                 self._ultimo_trafego.pop(menos_ativo, None)
 
-            # Adiciona novo dispositivo
+            # Cria o novo nó com MAC validado
             self.dispositivos[chave] = {
-                "ip":       chave,
-                "mac":      mac or "",
-                "hostname": hostname or "",
-                "pacotes":  1,
-                "portas":   set(),
+                "ip":        chave,
+                "mac":       mac,
+                "hostname":  hostname or "",
+                "pacotes":   1,
+                "portas":    set(),
+                "confianca": status_confianca,
             }
-            
+
             if not self._timer_layout.isActive():
                 self._timer_layout.start()
 
     def registrar_conexao(self, ip_origem: str, ip_destino: str,
                           porta_origem: int = 0, porta_destino: int = 0):
+        """
+        Registra uma aresta entre dois nós existentes.
+
+        [FIX-C] IMPORTANTE: este método NUNCA cria novos dispositivos.
+        Se um dos endpoints não existir na topologia, a aresta é ignorada.
+        Isso evita que ip_destino infle o grafo com nós fantasmas.
+        """
         if not eh_endereco_valido(ip_origem) or not eh_endereco_valido(ip_destino):
             return
+
         no_a = ip_origem  if self._pertence_rede(ip_origem)  else "internet"
         no_b = ip_destino if self._pertence_rede(ip_destino) else "internet"
+
         if no_a == no_b:
             return
-        if no_a not in self.dispositivos and no_b not in self.dispositivos:
-            return
+
+        # [FIX-C] Ambos os nós devem existir previamente — sem criação implícita.
+        #         Se ip_destino não foi descoberto por ARP ou sniffer com MAC,
+        #         a conexão não é desenhada (correto — host não confirmado).
+        with self._lock_dispositivos:
+            if no_a not in self.dispositivos or no_b not in self.dispositivos:
+                return
 
         chave = tuple(sorted([no_a, no_b]))
         self.contagem_conexoes[chave] += 1
 
-        if porta_destino and no_b in self.dispositivos:
-            self.dispositivos[no_b].setdefault("portas", set()).add(porta_destino)
-        if porta_origem and no_a in self.dispositivos:
-            self.dispositivos[no_a].setdefault("portas", set()).add(porta_origem)
+        with self._lock_dispositivos:
+            if porta_destino and no_b in self.dispositivos:
+                self.dispositivos[no_b].setdefault("portas", set()).add(porta_destino)
+            if porta_origem and no_a in self.dispositivos:
+                self.dispositivos[no_a].setdefault("portas", set()).add(porta_origem)
 
-    def adicionar_dispositivo_manual(self, ip: str, mac: str = "", hostname: str = ""):
-        self.registrar_origem(ip, mac, hostname)
+    def adicionar_dispositivo_manual(self, ip: str, mac: str = "",
+                                     hostname: str = ""):
+        """
+        Chamado pela varredura ARP ativa — fonte de maior confiança.
+        Passa confirmado_por_arp=True para elevar o status do nó.
+        """
+        self.registrar_origem(ip, mac, hostname, confirmado_por_arp=True)
 
     def limpar(self):
         self.dispositivos.clear()
@@ -341,13 +416,13 @@ class VisualizadorTopologia(QWidget):
         ]
         if not inativos:
             return
-        
+
         for ip in inativos:
             if ip in self.dispositivos:
                 del self.dispositivos[ip]
             self._posicoes_mundo.pop(ip, None)
             del self._ultimo_trafego[ip]
-        
+
         # Recalcula layout se removeu algo
         if not self._timer_layout.isActive():
             self._timer_layout.start()
@@ -811,7 +886,6 @@ class VisualizadorTopologia(QWidget):
         super().resizeEvent(evento)
 
 
-
 # ── Painel contentor ──────────────────────────────────────────────────────────
 
 class PainelTopologia(QWidget):
@@ -880,8 +954,13 @@ class PainelTopologia(QWidget):
     # ── Metodos publicos usados pela janela principal ──────────────────────
 
     def adicionar_dispositivo(self, ip: str, mac: str = "", hostname: str = ""):
-        """Chamado durante a captura - registra apenas IPs de origem."""
-        self.visualizador.registrar_origem(ip, mac, hostname)
+        """
+        Chamado durante a captura passiva (sniffer).
+        MAC obrigatório — sem MAC o nó não é criado (regra de ouro).
+        """
+        # confirmado_por_arp=False pois veio do sniffer, não de ARP reply
+        self.visualizador.registrar_origem(ip, mac, hostname,
+                                           confirmado_por_arp=False)
 
     def adicionar_conexao(self, ip_origem: str, ip_destino: str,
                           porta_origem: int = 0, porta_destino: int = 0):
@@ -890,8 +969,11 @@ class PainelTopologia(QWidget):
         )
 
     def adicionar_dispositivo_manual(self, ip: str, mac: str = "", hostname: str = ""):
-        """Chamado pela varredura ARP - aceita qualquer IP local valido."""
-        self.visualizador.adicionar_dispositivo_manual(ip, mac, hostname)
+        """
+        Chamado pela varredura ARP ativa — fonte primária e confiável.
+        """
+        self.visualizador.registrar_origem(ip, mac, hostname,
+                                           confirmado_por_arp=True)
 
     def atualizar(self):
         self.visualizador.update()
@@ -905,11 +987,11 @@ class PainelTopologia(QWidget):
         self.visualizador.limpar()
 
     def total_dispositivos(self) -> int:
-        """Retorna total de nÃ³s renderizados (ativos + descobertos)."""
+        """Retorna total de nós renderizados (ativos + descobertos)."""
         return len([ip for ip in self.visualizador.dispositivos if ip != "internet"])
 
     def total_dispositivos_ativos(self) -> int:
-        """Conta apenas nÃ³s que jÃ¡ trafegaram pacotes."""
+        """Conta apenas nós que já trafegaram pacotes."""
         return sum(
             1
             for ip, d in self.visualizador.dispositivos.items()

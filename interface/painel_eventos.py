@@ -289,9 +289,8 @@ class PainelEventos(QWidget):
         self.combo_protocolo = QComboBox()
         self.combo_protocolo.setMaximumWidth(140)
         self.combo_protocolo.addItems([
-            "Todos", "DNS", "HTTP", "HTTPS", "TCP_SYN", "TCP_FIN",
-            "TCP_RST", "ICMP", "ARP", "DHCP", "SSH", "FTP",
-            "SMB", "RDP", "NOVO_DISPOSITIVO",
+            "Todos", "DNS", "HTTP", "HTTPS", "TCP_SYN",
+            "ICMP", "ARP", "DHCP", "NOVO_DISPOSITIVO",
         ])
         self.combo_protocolo.currentTextChanged.connect(self._ao_mudar_filtro_protocolo)
         row.addWidget(self.combo_protocolo)

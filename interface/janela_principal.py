@@ -1,16 +1,4 @@
 ﻿# interface/janela_principal.py
-# Versão corrigida e profissional — NetLab Educacional
-#
-# Correções aplicadas nesta versão:
-#   [1] _obter_cidr_via_ipconfig: agora localiza o bloco correto no ipconfig
-#       usando o endereço IPv4 da interface (não o nome do adaptador, que
-#       frequentemente diverge entre Scapy e o sistema operacional).
-#   [2] _varredura_inicial_segura: limite aumentado de 30 para
-#       min(500, self._limite_hosts), garantindo que a topologia seja
-#       populada de forma significativa logo após iniciar a captura.
-#   [3] _iniciar_captura: timer de descoberta periódica agora é ativado
-#       corretamente após o início da captura.
-#   [4] _servir_bloqueado: assinatura corrigida (parâmetros alinhados).
 
 import threading
 import time
@@ -1421,12 +1409,17 @@ class JanelaPrincipal(QMainWindow):
         """
         Transfere pacotes da fila global para o analisador e coleta os
         eventos resultantes para exibição na UI.
+
+        REGRA DE OURO (não alterar):
+          • Apenas ip_origem com MAC válido cria nó na topologia.
+          • ip_destino NUNCA cria nó — só atualiza conexão.
+          • Conexão só é desenhada se os dois endpoints já existirem.
         """
-        # Transfere para o analisador (thread de análise)
+        # ── 1. Transfere pacotes brutos para o analisador (thread separada) ──
         for dados in fila_pacotes_global.consumir_todos():
             self.analisador.enfileirar(dados)
 
-        # Coleta eventos processados pelo analisador
+        # ── 2. Coleta eventos já processados pelo analisador ──────────────────
         eventos, _ = self.analisador.coletar_resultados()
 
         for evento in eventos:
@@ -1435,21 +1428,33 @@ class JanelaPrincipal(QMainWindow):
             mac_origem = evento.get("mac_origem", "")
             tipo       = evento.get("tipo",       "")
 
-            # Atualiza a topologia com os IPs do evento
-            if ip_origem and _ip_eh_topologizavel(ip_origem):
+            # [FIX-2] Valida se o MAC de origem é real (não broadcast/nulo)
+            mac_e_valido = (
+                mac_origem
+                and mac_origem not in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00", "")
+            )
+
+            # [FIX-1] Apenas ip_origem com MAC válido adiciona dispositivo.
+            #         ip_destino JAMAIS cria nó — regra estrutural.
+            if ip_origem and _ip_eh_topologizavel(ip_origem) and mac_e_valido:
                 self.painel_topologia.adicionar_dispositivo(ip_origem, mac_origem)
-            if ip_destino and _ip_eh_topologizavel(ip_destino):
-                self.painel_topologia.adicionar_dispositivo(ip_destino, "")
-            if (ip_origem and ip_destino
-                    and _ip_eh_topologizavel(ip_origem)
-                    and _ip_eh_topologizavel(ip_destino)):
+
+            # [FIX-3] Conexão só é adicionada; destino NÃO cria nó implicitamente.
+            #         O painel_topologia.adicionar_conexao() já trata isso internamente.
+            if (
+                ip_origem and ip_destino
+                and _ip_eh_topologizavel(ip_origem)
+                and _ip_eh_topologizavel(ip_destino)
+            ):
                 self.painel_topologia.adicionar_conexao(ip_origem, ip_destino)
 
-            # Enfileira evento para exibição pedagógica (com cooldown)
+            # ── Enfileira evento para exibição pedagógica (com cooldown) ──────
             if tipo:
                 if tipo == "NOVO_DISPOSITIVO":
                     if ip_origem:
-                        status = self.estado_rede.registrar_dispositivo(ip_origem, mac_origem)
+                        status = self.estado_rede.registrar_dispositivo(
+                            ip_origem, mac_origem
+                        )
                         if status == "NOVO" and self.estado_rede.deve_emitir_evento(
                             f"novo_{ip_origem}", cooldown=30
                         ):
@@ -1462,7 +1467,6 @@ class JanelaPrincipal(QMainWindow):
                     chave = f"{tipo}_{ip_origem}_{discriminador}"
 
                     if tipo in ("HTTP", "HTTPS"):
-                        # HTTP/HTTPS: sempre exibe (relevância pedagógica alta)
                         self.fila_eventos_ui.append(evento)
                     elif tipo == "DNS":
                         chave_dns = f"DNS_{ip_origem}_{evento.get('dominio', '')}"
@@ -1472,15 +1476,15 @@ class JanelaPrincipal(QMainWindow):
                         if self.estado_rede.deve_emitir_evento(chave, cooldown=5):
                             self.fila_eventos_ui.append(evento)
 
-        # Atualiza snapshot de estatísticas para o próximo ciclo da UI
+        # ── 3. Atualiza snapshot para o próximo ciclo da UI ───────────────────
         self._snapshot_atual = {
-            "total_bytes":       self.analisador.total_bytes,
-            "total_pacotes":     self.analisador.total_pacotes,
-            "estatisticas":      self.analisador.obter_estatisticas_protocolos(),
-            "top_dispositivos":  self.analisador.obter_top_dispositivos(),
+            "total_bytes":        self.analisador.total_bytes,
+            "total_pacotes":      self.analisador.total_pacotes,
+            "estatisticas":       self.analisador.obter_estatisticas_protocolos(),
+            "top_dispositivos":   self.analisador.obter_top_dispositivos(),
             "dispositivos_ativos": len(self.analisador.trafego_dispositivos),
-            "top_dns":           self.analisador.obter_top_dns(),
-            "historias":         self._gerar_historias(),
+            "top_dns":            self.analisador.obter_top_dns(),
+            "historias":          self._gerar_historias(),
         }
 
     def _agregar_eventos(self, eventos: list) -> list:
@@ -1773,16 +1777,23 @@ class JanelaPrincipal(QMainWindow):
 
     @pyqtSlot(str, str, str)
     def _ao_encontrar_dispositivo(self, ip: str, mac: str, hostname: str):
-        """Adiciona dispositivo descoberto à topologia e agenda evento pedagógico."""
+        """
+        Slot chamado pela thread de varredura ARP ativa.
+        Apenas dispositivos com MAC válido chegam aqui (filtrado no thread).
+        """
         if not _ip_eh_topologizavel(ip):
             return
+
+        # adicionar_dispositivo_manual → confirmado_por_arp=True internamente
         self.painel_topologia.adicionar_dispositivo_manual(ip, mac, hostname)
+
+        # Agenda evento pedagógico de novo dispositivo
         self.fila_eventos_ui.append({
             "tipo":       "NOVO_DISPOSITIVO",
             "ip_origem":  ip,
             "ip_destino": "",
             "mac_origem": mac,
-            "protocolo":  "ARP/DHCP",
+            "protocolo":  "ARP",
             "tamanho":    0,
         })
 
@@ -1899,7 +1910,7 @@ class JanelaPrincipal(QMainWindow):
         QMessageBox.about(
             self,
             "Sobre o NetLab Educacional",
-            "<h2>NetLab Educacional V3.0</h2>"
+            "<h2>NetLab Educacional V3.1</h2>"
             "<p>Plataforma educacional para análise de redes locais com "
             "captura de pacotes em tempo real e explicações didáticas "
             "automatizadas.</p>"
@@ -1908,7 +1919,7 @@ class JanelaPrincipal(QMainWindow):
             "<p><b>Tecnologias:</b> Python · PyQt6 · Scapy · PyQtGraph</p>"
             "<p><b>Destaques:</b> DPI, detecção de dados sensíveis, "
             "identificação via MAC/OUI e monitoramento em tempo real.</p>"
-            "<p><b>Autor:</b> Yuri Gonçalves Pavão</p>"
+            "<p><b>Autor:</b>Yuri Gonçalves Pavão</p>"
             "<p><b>Instagram:</b> @yuri_g0n | "
             "<b>GitHub:</b> github.com/yurigonpav</p>"
         )
