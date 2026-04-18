@@ -180,7 +180,7 @@ class VisualizadorTopologia(QWidget):
     RAIO_MIN        = 7
     RAIO_MAX        = 30
     MAX_DISPOSITIVOS = 50               # Limite realista: apenas dispositivos com tráfego real
-    TIMEOUT_INATIVIDADE = 120
+    TIMEOUT_INATIVIDADE = 1800
 
     # Conjunto de MACs inválidos que nunca representam um host real (PATCH)
     _MACS_INVALIDOS = frozenset({
@@ -197,11 +197,14 @@ class VisualizadorTopologia(QWidget):
         self._posicoes_mundo: Dict[str, QPointF]  = {}
         self._ip_local = obter_ip_local()
         self._rede_local = None  # ipaddress.ip_network
+        self.subredes: Dict[str, dict] = {}
+        self._subrede_por_ip: Dict[str, str] = {}
         self._ultimo_trafego: Dict[str, float]    = {}  # timestamp da última atividade
         self._lock_dispositivos = threading.Lock()  # Lock para acesso thread-safe
 
         self._zoom       = 1.0
         self._offset     = QPointF(0, 0)
+        self._mostrar_subredes = False
         self._drag_inicio: Optional[QPoint] = None
         self._offset_drag_inicio = QPointF(0, 0)
         self._no_hover: Optional[str]      = None
@@ -247,7 +250,7 @@ class VisualizadorTopologia(QWidget):
         return len(mac.replace(":", "").replace("-", "")) == 12
 
     def registrar_origem(self, ip: str, mac: str = "", hostname: str = "",
-                         confirmado_por_arp: bool = False):
+                         confirmado_por_arp: bool = False, cidr: str = ""):
         """
         Registra uma origem de tráfego na topologia.
 
@@ -269,14 +272,14 @@ class VisualizadorTopologia(QWidget):
         if not self._mac_e_valido(mac):
             # Exceção: se o nó JÁ existe (descoberto via ARP antes), apenas
             # incrementa o contador de pacotes sem exigir MAC novamente.
-            chave = ip if self._pertence_rede(ip) else "internet"
+            chave = ip if (ip in self._subrede_por_ip or self._pertence_rede(ip)) else "internet"
             with self._lock_dispositivos:
                 if chave in self.dispositivos:
                     self.dispositivos[chave]["pacotes"] += 1
                     self._ultimo_trafego[chave] = time.time()
             return
 
-        chave = ip if self._pertence_rede(ip) else "internet"
+        chave = self._resolver_chave_no(ip, cidr)
         agora = time.time()
 
         # [FIX-B] Status de confiança: ARP reply > sniffer passivo
@@ -308,6 +311,8 @@ class VisualizadorTopologia(QWidget):
                     self.dispositivos[chave]["mac"] = mac
                 if hostname:
                     self.dispositivos[chave]["hostname"] = hostname
+                if cidr:
+                    self.dispositivos[chave]["subrede"] = cidr
                 # Promove para CONFIRMADO se veio de ARP
                 if confirmado_por_arp:
                     self.dispositivos[chave]["confianca"] = "CONFIRMADO"
@@ -318,13 +323,20 @@ class VisualizadorTopologia(QWidget):
 
             if len(locais_atuais) >= self.MAX_DISPOSITIVOS:
                 # Remove o menos ativo (menor contador de pacotes)
+                candidatos_remocao = [
+                    chave for chave in locais_atuais
+                    if self.dispositivos.get(chave, {}).get("confianca") != "CONFIRMADO"
+                ]
+                if not candidatos_remocao:
+                    return
                 menos_ativo = min(
-                    locais_atuais,
+                    candidatos_remocao,
                     key=lambda k: self.dispositivos[k]["pacotes"]
                 )
                 del self.dispositivos[menos_ativo]
                 self._posicoes_mundo.pop(menos_ativo, None)
                 self._ultimo_trafego.pop(menos_ativo, None)
+                self._remover_ip_de_subredes(menos_ativo)
 
             # Cria o novo nó com MAC validado
             self.dispositivos[chave] = {
@@ -334,6 +346,7 @@ class VisualizadorTopologia(QWidget):
                 "pacotes":   1,
                 "portas":    set(),
                 "confianca": status_confianca,
+                "subrede":   cidr or self._subrede_por_ip.get(ip, ""),
             }
 
             if not self._timer_layout.isActive():
@@ -351,8 +364,8 @@ class VisualizadorTopologia(QWidget):
         if not eh_endereco_valido(ip_origem) or not eh_endereco_valido(ip_destino):
             return
 
-        no_a = ip_origem  if self._pertence_rede(ip_origem)  else "internet"
-        no_b = ip_destino if self._pertence_rede(ip_destino) else "internet"
+        no_a = self._resolver_chave_no(ip_origem)
+        no_b = self._resolver_chave_no(ip_destino)
 
         if no_a == no_b:
             return
@@ -381,10 +394,125 @@ class VisualizadorTopologia(QWidget):
         """
         self.registrar_origem(ip, mac, hostname, confirmado_por_arp=True)
 
+    def atualizar_subredes(self, lista_subredes):
+        """Sincroniza a visualizacao com a lista atual de sub-redes conhecidas."""
+        cidrs_recebidos = set()
+
+        for subrede in lista_subredes:
+            cidr = subrede.cidr
+            cidrs_recebidos.add(cidr)
+            info_atual = self.subredes.get(cidr, {})
+            self.subredes[cidr] = {
+                "cidr": cidr,
+                "gateway": subrede.gateway,
+                "visibilidade": subrede.visibilidade.value,
+                "hosts": set(subrede.hosts),
+                "local": bool(getattr(subrede, "local", False)) or info_atual.get("local", False),
+            }
+
+        for cidr in list(self.subredes):
+            if cidr not in cidrs_recebidos:
+                del self.subredes[cidr]
+
+        self._reconstruir_mapa_subredes()
+        if not self._timer_layout.isActive():
+            self._timer_layout.start()
+        self.update()
+
+    def _reconstruir_mapa_subredes(self):
+        """Reconstrui o indice rapido IP -> CIDR a partir do estado atual."""
+        self._subrede_por_ip.clear()
+        for ip, dados in self.dispositivos.items():
+            if ip != "internet":
+                dados["subrede"] = ""
+        for cidr, info_subrede in self.subredes.items():
+            for ip in info_subrede.get("hosts", set()):
+                self._subrede_por_ip[ip] = cidr
+                if ip in self.dispositivos:
+                    self.dispositivos[ip]["subrede"] = cidr
+
+    def _registrar_ip_em_subrede(self, ip: str, cidr: str):
+        """Associa um IP a uma sub-rede ja conhecida pelo painel."""
+        if not ip or not cidr:
+            return
+        info_subrede = self.subredes.setdefault(
+            cidr,
+            {
+                "cidr": cidr,
+                "gateway": "",
+                "visibilidade": "parcial",
+                "hosts": set(),
+                "local": False,
+            },
+        )
+        info_subrede.setdefault("hosts", set()).add(ip)
+        self._subrede_por_ip[ip] = cidr
+
+    def _resolver_chave_no(self, ip: str, cidr: str = "") -> str:
+        """
+        Decide se o IP vira um no individual ou deve ser agrupado como internet.
+
+        Regras:
+        - CIDR explicito vence.
+        - Hosts de qualquer sub-rede conhecida ficam individualizados.
+        - Enderecos fora de segmentos conhecidos continuam agrupados em internet.
+        """
+        if cidr:
+            self._registrar_ip_em_subrede(ip, cidr)
+            return ip
+        if ip in self._subrede_por_ip:
+            return ip
+        if self._pertence_rede(ip):
+            return ip
+        return "internet"
+
+    def _remover_ip_de_subredes(self, ip: str):
+        """Remove um host do mapa de sub-redes sem destruir o segmento em si."""
+        cidr = self._subrede_por_ip.pop(ip, "")
+        if not cidr:
+            return
+        info_subrede = self.subredes.get(cidr)
+        if not info_subrede:
+            return
+        info_subrede.get("hosts", set()).discard(ip)
+
+    def adicionar_dispositivo_com_subrede(
+        self,
+        ip: str,
+        mac: str,
+        cidr: str,
+        local: bool,
+        hostname: str = "",
+        confirmado_por_arp: bool = False,
+    ):
+        """Adiciona ou atualiza um dispositivo explicitamente associado a uma sub-rede."""
+        info_subrede = self.subredes.setdefault(
+            cidr,
+            {
+                "cidr": cidr,
+                "gateway": "",
+                "visibilidade": "parcial",
+                "hosts": set(),
+                "local": local,
+            },
+        )
+        info_subrede["local"] = bool(info_subrede.get("local")) or local
+        info_subrede.setdefault("hosts", set()).add(ip)
+        self._subrede_por_ip[ip] = cidr
+        self.registrar_origem(
+            ip,
+            mac,
+            hostname,
+            confirmado_por_arp=confirmado_por_arp,
+            cidr=cidr,
+        )
+
     def limpar(self):
         self.dispositivos.clear()
         self.contagem_conexoes.clear()
         self._posicoes_mundo.clear()
+        self.subredes.clear()
+        self._subrede_por_ip.clear()
         self._ultimo_trafego.clear()
         self._no_selecionado = None
         self._no_hover = None
@@ -398,7 +526,10 @@ class VisualizadorTopologia(QWidget):
 
     def _remover_menos_ativo(self):
         """Remove o dispositivo local com menor contagem de pacotes."""
-        locais = self._obter_dispositivos_locais()
+        locais = [
+            ip for ip in self._obter_dispositivos_locais()
+            if self.dispositivos.get(ip, {}).get("confianca") != "CONFIRMADO"
+        ]
         if not locais:
             return
         # Encontra o IP com menor número de pacotes
@@ -406,13 +537,18 @@ class VisualizadorTopologia(QWidget):
         del self.dispositivos[menos_ativo]
         self._posicoes_mundo.pop(menos_ativo, None)
         self._ultimo_trafego.pop(menos_ativo, None)
+        self._remover_ip_de_subredes(menos_ativo)
 
     def _remover_inativos(self):
         """Remove dispositivos sem tráfego há mais de 5 minutos."""
         agora = time.time()
         inativos = [
             ip for ip, ts in self._ultimo_trafego.items()
-            if ip != "internet" and (agora - ts) > self.TIMEOUT_INATIVIDADE
+            if (
+                ip != "internet"
+                and (agora - ts) > self.TIMEOUT_INATIVIDADE
+                and self.dispositivos.get(ip, {}).get("confianca") == "OBSERVADO"
+            )
         ]
         if not inativos:
             return
@@ -422,6 +558,7 @@ class VisualizadorTopologia(QWidget):
                 del self.dispositivos[ip]
             self._posicoes_mundo.pop(ip, None)
             del self._ultimo_trafego[ip]
+            self._remover_ip_de_subredes(ip)
 
         # Recalcula layout se removeu algo
         if not self._timer_layout.isActive():
@@ -480,6 +617,11 @@ class VisualizadorTopologia(QWidget):
         self._auto_zoom()
         self.update()
 
+    def definir_mostrar_subredes(self, mostrar: bool):
+        """Controla a renderizacao opcional das sub-redes."""
+        self._mostrar_subredes = bool(mostrar)
+        self.update()
+
     def definir_rede_local(self, cidr: str):
         """Define a rede local (CIDR) para filtrar nós fora da LAN."""
         try:
@@ -487,6 +629,11 @@ class VisualizadorTopologia(QWidget):
             self._rede_local = ipaddress.ip_network(cidr, strict=False) if cidr else None
         except Exception:
             self._rede_local = None
+
+        for info_subrede in self.subredes.values():
+            info_subrede["local"] = False
+        if cidr and cidr in self.subredes:
+            self.subredes[cidr]["local"] = True
 
     def _pertence_rede(self, ip: str) -> bool:
         """
@@ -519,7 +666,7 @@ class VisualizadorTopologia(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.fillRect(self.rect(), self.COR_FUNDO)
 
-        if not self.dispositivos:
+        if not self.dispositivos and (not self.subredes or not self._mostrar_subredes):
             self._pintar_vazio(p)
             return
 
@@ -527,9 +674,13 @@ class VisualizadorTopologia(QWidget):
         p.translate(self._offset)
         p.scale(self._zoom, self._zoom)
         self._pintar_conexoes(p)
+        if self._mostrar_subredes:
+            self._pintar_subredes(p)
         self._pintar_nos(p)
         p.restore()
 
+        if self._mostrar_subredes:
+            self._pintar_subredes_sem_hosts(p)
         self._pintar_legenda(p)
         self._pintar_info(p)
         self._pintar_tooltip(p)
@@ -575,6 +726,124 @@ class VisualizadorTopologia(QWidget):
 
             p.setPen(QPen(cor, espessura))
             p.drawLine(self._posicoes_mundo[no_a], self._posicoes_mundo[no_b])
+
+    def _estilo_subrede(self, visibilidade: str) -> tuple:
+        """Retorna as cores e o estilo de linha usados para a sub-rede."""
+        if visibilidade == "total":
+            return (
+                QColor(46, 204, 113, 200),
+                QColor(46, 204, 113, 24),
+                Qt.PenStyle.SolidLine,
+            )
+        if visibilidade == "parcial":
+            return (
+                QColor(241, 196, 15, 200),
+                QColor(241, 196, 15, 24),
+                Qt.PenStyle.SolidLine,
+            )
+        return (
+            QColor(155, 89, 182, 170),
+            QColor(155, 89, 182, 18),
+            Qt.PenStyle.DashLine,
+        )
+
+    def _texto_subrede(self, info_subrede: dict) -> str:
+        """Monta o rotulo textual da sub-rede para a interface."""
+        texto = info_subrede.get("cidr", "")
+        gateway = info_subrede.get("gateway")
+        visibilidade = info_subrede.get("visibilidade", "inferida")
+        if gateway:
+            texto += f"  gw: {gateway}"
+        texto += f"  [{visibilidade}]"
+        return texto
+
+    def _pintar_subredes(self, p: QPainter):
+        """Desenha grupos de sub-rede para hosts que ja possuem posicao no grafo."""
+        if not self.subredes:
+            return
+
+        for _cidr, info_subrede in self.subredes.items():
+            hosts_visiveis = [
+                ip for ip in info_subrede.get("hosts", set())
+                if ip in self.dispositivos and ip in self._posicoes_mundo
+            ]
+            if not hosts_visiveis:
+                continue
+
+            pontos = [self._posicoes_mundo[ip] for ip in hosts_visiveis]
+            xs = [ponto.x() for ponto in pontos]
+            ys = [ponto.y() for ponto in pontos]
+            margem = 70
+            retangulo = QRectF(
+                min(xs) - margem,
+                min(ys) - margem,
+                (max(xs) - min(xs)) + margem * 2,
+                (max(ys) - min(ys)) + margem * 2,
+            )
+
+            cor_borda, cor_fundo, estilo_linha = self._estilo_subrede(
+                info_subrede.get("visibilidade", "inferida")
+            )
+            caneta = QPen(cor_borda, 2)
+            caneta.setStyle(estilo_linha)
+            p.setPen(caneta)
+            p.setBrush(QBrush(cor_fundo))
+            p.drawRoundedRect(retangulo, 12, 12)
+
+            p.setPen(QPen(QColor(220, 225, 235)))
+            p.setFont(QFont("Arial", 9, QFont.Weight.Bold))
+            p.drawText(
+                retangulo.adjusted(10, 8, -10, -8),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
+                self._texto_subrede(info_subrede),
+            )
+
+    def _pintar_subredes_sem_hosts(self, p: QPainter):
+        """
+        Desenha placeholders honestos para sub-redes inferidas sem hosts confirmados.
+
+        Isso evita esconder segmentos conhecidos so porque ainda nao existem
+        endpoints suficientes para formar uma caixa ao redor de nos reais.
+        """
+        subredes_sem_hosts = [
+            info_subrede
+            for info_subrede in self.subredes.values()
+            if not any(
+                ip in self.dispositivos and ip in self._posicoes_mundo
+                for ip in info_subrede.get("hosts", set())
+            )
+        ]
+        if not subredes_sem_hosts:
+            return
+
+        x = 12
+        y = 12
+        largura = min(320, max(220, self.width() // 3))
+        altura = 34
+
+        for info_subrede in subredes_sem_hosts:
+            cor_borda, cor_fundo, estilo_linha = self._estilo_subrede(
+                info_subrede.get("visibilidade", "inferida")
+            )
+            retangulo = QRectF(x, y, largura, altura)
+
+            caneta = QPen(cor_borda, 1.8)
+            caneta.setStyle(estilo_linha)
+            p.setPen(caneta)
+            p.setBrush(QBrush(cor_fundo))
+            p.drawRoundedRect(retangulo, 8, 8)
+
+            p.setPen(QPen(QColor(220, 225, 235)))
+            p.setFont(QFont("Arial", 8, QFont.Weight.Bold))
+            p.drawText(
+                retangulo.adjusted(10, 0, -10, 0),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                self._texto_subrede(info_subrede),
+            )
+            y += altura + 8
+
+            if y + altura > self.height() - 110:
+                break
 
     def _pintar_nos(self, p: QPainter):
         ordem = list(self.dispositivos.keys())
@@ -682,7 +951,7 @@ class VisualizadorTopologia(QWidget):
             y += 18
 
     def _pintar_info(self, p: QPainter):
-        locais   = sum(1 for ip in self.dispositivos if ip != "internet")
+        locais   = self.total_dispositivos_nao_internet()
         conexoes = len(self.contagem_conexoes)
         zoom_pct = int(self._zoom * 100)
         texto    = (
@@ -759,7 +1028,7 @@ class VisualizadorTopologia(QWidget):
             return self.COR_NO_INTERNET
         if ip == self._ip_local:
             return self.COR_NO_LOCAL
-        if ip.endswith(".1") or ip.endswith(".254"):
+        if self._ip_eh_gateway(ip):
             return self.COR_NO_GATEWAY
         return self.COR_NO_NORMAL
 
@@ -768,9 +1037,20 @@ class VisualizadorTopologia(QWidget):
             return "Externo / Internet"
         if ip == self._ip_local:
             return "Este computador"
-        if ip.endswith(".1") or ip.endswith(".254"):
+        if self._ip_eh_gateway(ip):
             return "Gateway / Roteador"
         return "Dispositivo local"
+
+    def _ip_eh_gateway(self, ip: str) -> bool:
+        """Detecta gateways conhecidos sem depender apenas do sufixo do endereco."""
+        for info_subrede in self.subredes.values():
+            if info_subrede.get("gateway") == ip:
+                return True
+        return ip.endswith(".1") or ip.endswith(".254")
+
+    def total_dispositivos_nao_internet(self) -> int:
+        """Conta os nos presentes na topologia, excluindo o agrupador Internet."""
+        return sum(1 for ip in self.dispositivos if ip != "internet")
 
     def _raio_do_no(self, ip: str) -> float:
         """Raio cresce logaritmicamente com o volume de trafego."""
@@ -916,10 +1196,10 @@ class PainelTopologia(QWidget):
         layout.addWidget(self._area, 1)
 
         rodape = QLabel(
-            "Apenas dispositivos que originaram pacotes sao exibidos.  "
-            "IPs externos sao agrupados em 'Internet'.  "
-            "Nos maiores = maior volume de trafego.  "
-            "Clique num no para detalhes."
+            "Apenas dispositivos que originaram pacotes são exibidos. "
+            "IPs externos são agrupados em 'Internet'. "
+            "Nós maiores = maior volume de tráfego. "
+            "Clique em um nó para detalhes."
         )
         rodape.setStyleSheet(
             "color: #566573; font-size: 9px; padding: 3px 6px;"
@@ -975,8 +1255,28 @@ class PainelTopologia(QWidget):
         self.visualizador.registrar_origem(ip, mac, hostname,
                                            confirmado_por_arp=True)
 
+    def adicionar_dispositivo_com_subrede(
+        self,
+        ip: str,
+        mac: str,
+        cidr: str,
+        local: bool,
+        hostname: str = "",
+        confirmado_por_arp: bool = False,
+    ):
+        self.visualizador.adicionar_dispositivo_com_subrede(
+            ip, mac, cidr, local, hostname, confirmado_por_arp
+        )
+
+    def atualizar_subredes(self, lista_subredes):
+        self.visualizador.atualizar_subredes(lista_subredes)
+
     def atualizar(self):
         self.visualizador.update()
+
+    def definir_mostrar_subredes(self, mostrar: bool):
+        """Mostra ou oculta as sub-redes sem perder os dados coletados."""
+        self.visualizador.definir_mostrar_subredes(mostrar)
 
     def definir_rede_local(self, cidr: str):
         """Define rede local para filtrar o que é exibido na topologia."""
@@ -988,7 +1288,7 @@ class PainelTopologia(QWidget):
 
     def total_dispositivos(self) -> int:
         """Retorna total de nós renderizados (ativos + descobertos)."""
-        return len([ip for ip in self.visualizador.dispositivos if ip != "internet"])
+        return self.visualizador.total_dispositivos_nao_internet()
 
     def total_dispositivos_ativos(self) -> int:
         """Conta apenas nós que já trafegaram pacotes."""

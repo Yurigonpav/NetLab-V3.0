@@ -11,7 +11,7 @@ from typing import Optional
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout,
-    QLabel, QPushButton, QComboBox,
+    QLabel, QPushButton, QComboBox, QCheckBox,
     QMessageBox, QToolBar, QTabWidget,
     QDialog, QHBoxLayout, QTextEdit,
     QDialogButtonBox, QFrame
@@ -26,6 +26,7 @@ from interface.painel_trafego import PainelTrafego
 from interface.painel_eventos import PainelEventos
 from painel_servidor import PainelServidor
 from utils.constantes import PORTAS_HTTP, PORTAS_DHCP
+from utils.gerenciador_subredes import GerenciadorSubRedes, Visibilidade
 from utils.rede import obter_ip_local
 
 
@@ -34,10 +35,6 @@ from utils.rede import obter_ip_local
 # ============================================================================
 
 def _ip_eh_topologizavel(ip: str) -> bool:
-    """
-    Retorna True apenas para IPs que devem aparecer na topologia.
-    Descartados: loopback, link-local, multicast, broadcast, rede zero.
-    """
     if not ip:
         return False
     try:
@@ -58,21 +55,12 @@ def _ip_eh_topologizavel(ip: str) -> bool:
 
 
 class EstadoRede:
-    """
-    Gerencia o cooldown entre eventos repetidos e o mapeamento de
-    dispositivos já descobertos na sessão atual.
-    """
-
     def __init__(self):
         self.ultimos_eventos: dict = {}
         self.dispositivos:    dict = {}
         self._lock = threading.Lock()
 
     def deve_emitir_evento(self, chave: str, cooldown: int = 5) -> bool:
-        """
-        Retorna True se o evento identificado por `chave` pode ser emitido
-        (respeitando o cooldown em segundos). Atualiza o timestamp interno.
-        """
         agora = time.time()
         with self._lock:
             if chave in self.ultimos_eventos:
@@ -82,10 +70,6 @@ class EstadoRede:
             return True
 
     def registrar_dispositivo(self, ip: str, mac: str = "", hostname: str = "") -> str:
-        """
-        Registra um dispositivo na sessão. Retorna "NOVO" na primeira vez
-        ou "EXISTENTE" se o IP já foi visto antes.
-        """
         with self._lock:
             if ip not in self.dispositivos:
                 self.dispositivos[ip] = (mac, hostname, time.time())
@@ -97,16 +81,10 @@ class EstadoRede:
 
 
 # ============================================================================
-# Fila global de pacotes — buffer circular thread-safe
+# Fila global de pacotes
 # ============================================================================
 
 class _FilaPacotesGlobal:
-    """
-    Buffer circular thread-safe que armazena os pacotes capturados pelo
-    sniffer antes de serem processados pelo analisador.
-    Limit máximo: 20.000 entradas (descarte automático das mais antigas).
-    """
-
     def __init__(self):
         self._fila: deque = deque(maxlen=20_000)
         self._lock = threading.Lock()
@@ -130,7 +108,6 @@ fila_pacotes_global = _FilaPacotesGlobal()
 
 
 def obter_interfaces_disponiveis() -> list:
-    """Fallback simples: retorna a lista de interfaces sem detalhes."""
     try:
         from scapy.arch.windows import get_windows_if_list
         interfaces = get_windows_if_list()
@@ -144,24 +121,13 @@ def obter_interfaces_disponiveis() -> list:
 
 
 # ============================================================================
-# Thread do sniffer — captura de pacotes via AsyncSniffer do Scapy
+# Thread do sniffer
 # ============================================================================
 
-# Limite de pacotes aceitos por segundo. Pacotes além desse limite são
-# descartados silenciosamente para proteger a fila e a interface gráfica.
 _MAX_PACOTES_POR_SEGUNDO = 800
 
 
 class _CapturadorPacotesThread(QThread):
-    """
-    Captura pacotes via AsyncSniffer e os deposita na fila global.
-
-    Características:
-    - Reinício automático se o socket do Scapy falhar.
-    - Rate limiter: descarta pacotes além de _MAX_PACOTES_POR_SEGUNDO.
-    - Tratamento de exceções por pacote para não derrubar a thread.
-    """
-
     erro_ocorrido = pyqtSignal(str)
     sem_pacotes   = pyqtSignal(str)
 
@@ -170,20 +136,14 @@ class _CapturadorPacotesThread(QThread):
         self.interface = interface
         self._rodando  = False
         self.sniffer   = None
-
-        # Contadores do rate limiter
         self._pps_contador  = 0
         self._pps_reset_ts  = 0.0
 
     def run(self):
         self._rodando = True
-
         while self._rodando:
             try:
                 from scapy.all import AsyncSniffer
-
-                # TCPSession removido intencionalmente — evita reassembly
-                # custoso que inflava volume e causava erros de unpack.
                 self.sniffer = AsyncSniffer(
                     iface=self.interface,
                     prn=self._processar_pacote,
@@ -192,20 +152,16 @@ class _CapturadorPacotesThread(QThread):
                     promisc=True,
                 )
                 self.sniffer.start()
-
-                # Monitora se o sniffer permanece ativo; reinicia se parar.
                 while self._rodando:
                     self.sleep(1)
                     if not getattr(self.sniffer, 'running', False):
                         if self._rodando:
                             break
-
             except Exception as erro:
                 if self._rodando:
                     print(f"[Capturador] Socket falhou: {erro} — reiniciando em 2s")
             finally:
                 self._parar_sniffer_seguro()
-
             if self._rodando:
                 for _ in range(20):
                     if not self._rodando:
@@ -213,7 +169,6 @@ class _CapturadorPacotesThread(QThread):
                     time.sleep(0.1)
 
     def _parar_sniffer_seguro(self):
-        """Para o sniffer sem lançar exceção."""
         if self.sniffer:
             try:
                 if getattr(self.sniffer, 'running', False):
@@ -223,14 +178,8 @@ class _CapturadorPacotesThread(QThread):
             self.sniffer = None
 
     def _processar_pacote(self, pacote):
-        """
-        Callback chamado pelo AsyncSniffer para cada pacote capturado.
-        Aplica o rate limiter e encaminha para _parsear_e_enfileirar.
-        """
         if not self._rodando:
             return
-
-        # Rate limiter — janela deslizante de 1 segundo
         agora = time.time()
         if agora - self._pps_reset_ts >= 1.0:
             self._pps_contador = 0
@@ -238,14 +187,12 @@ class _CapturadorPacotesThread(QThread):
         self._pps_contador += 1
         if self._pps_contador > _MAX_PACOTES_POR_SEGUNDO:
             return
-
         try:
             self._parsear_e_enfileirar(pacote)
         except Exception:
-            pass   # Pacote corrompido: ignora sem interromper a captura
+            pass
 
     def _parsear_e_enfileirar(self, pacote):
-        """Extrai os campos relevantes do pacote e coloca na fila global."""
         dados = {
             "tamanho":       len(pacote),
             "ip_origem":     None,
@@ -292,7 +239,6 @@ class _CapturadorPacotesThread(QThread):
                 ):
                     dados["protocolo"] = "DHCP"
                     dados["dhcp_tipo"] = ""
-
                     if pacote.haslayer(DHCP):
                         mapa_tipos_dhcp = {
                             1: "discover", 2: "offer",  3: "request",
@@ -315,7 +261,6 @@ class _CapturadorPacotesThread(QThread):
                                 else:
                                     dados["dhcp_tipo"] = str(valor_opcao)
                                 break
-
                     if pacote.haslayer(BOOTP):
                         dados["dhcp_xid"] = int(
                             getattr(pacote[BOOTP], "xid", 0) or 0
@@ -350,15 +295,10 @@ class _CapturadorPacotesThread(QThread):
 
 
 # ============================================================================
-# Thread de descoberta de dispositivos — varredura ARP + ICMP
+# Thread de descoberta de dispositivos
 # ============================================================================
 
 class _DescobrirDispositivosThread(QThread):
-    """
-    Descobre hosts na rede local via ARP sweep e, opcionalmente, ICMP.
-    Emite sinais para cada dispositivo encontrado e ao término.
-    """
-
     dispositivo_encontrado = pyqtSignal(str, str, str)
     varredura_concluida    = pyqtSignal(list)
     progresso_atualizado   = pyqtSignal(str)
@@ -501,28 +441,23 @@ class _DescobrirDispositivosThread(QThread):
                         try:
                             ip_resp  = resp[ARP].psrc
                             mac_resp = resp[ARP].hwsrc
-
                             if not mac_resp or mac_resp.lower() in (
                                 "ff:ff:ff:ff:ff:ff",
                                 "00:00:00:00:00:00",
                                 "",
                             ):
                                 continue
-
-                            # Identifica gateway pelo último octeto
                             if not self._mac_gateway:
                                 partes_ip = ip_resp.split(".")
                                 if len(partes_ip) == 4:
                                     ultimo_octeto = int(partes_ip[-1])
                                     if ultimo_octeto in (1, 254):
                                         self._mac_gateway = mac_resp.lower()
-
                             if (
                                 self._mac_gateway
                                 and mac_resp.lower() == self._mac_gateway
                             ):
                                 continue
-
                             if self._ip_valido(ip_resp):
                                 self._registrar(ip_resp, mac_resp, "")
                                 encontrados_nesta_rodada += 1
@@ -624,17 +559,13 @@ class _DescobrirDispositivosThread(QThread):
         return ""
 
     def _selecionar_hosts(self, rede: ipaddress.IPv4Network) -> list:
-        """
-        Retorna a lista de hosts a varrer. Se o total superar o limite,
-        faz amostragem uniforme para não sobrecarregar a rede.
-        """
         total_hosts = max(0, rede.num_addresses - 2)
         if total_hosts <= 0:
             return []
         limite = self._limite_hosts
         if total_hosts <= limite:
             return [str(h) for h in rede.hosts()]
-        passo       = max(1, total_hosts // limite)
+        passo        = max(1, total_hosts // limite)
         selecionados = []
         for idx, host in enumerate(rede.hosts()):
             if idx % passo == 0:
@@ -699,8 +630,6 @@ _sinal_pedagogico_global = _SinalPedagogico()
 
 
 class _WorkerRunnable(QRunnable):
-    """Executa a geração de explicações pedagógicas em uma thread de background."""
-
     def __init__(self, evento: dict, motor):
         super().__init__()
         self.evento = evento
@@ -732,7 +661,6 @@ class _WorkerRunnable(QRunnable):
 # ============================================================================
 
 class JanelaPrincipal(QMainWindow):
-    """Janela principal do NetLab Educacional."""
 
     def __init__(self):
         super().__init__()
@@ -744,14 +672,12 @@ class JanelaPrincipal(QMainWindow):
         self.descoberta_rodando: bool = False
         self.em_captura: bool = False
 
-        # Mapeamentos de interface (descrição → atributos técnicos)
         self._mapa_interface_nome:    dict = {}
         self._mapa_interface_ip:      dict = {}
         self._mapa_interface_mascara: dict = {}
         self._interface_captura = ""
         self._cidr_captura      = ""
 
-        # Snapshot de estatísticas (atualizado a cada ciclo do timer)
         self._snapshot_atual = {
             "total_bytes": 0, "total_pacotes": 0,
             "estatisticas": [], "top_dispositivos": [],
@@ -761,10 +687,10 @@ class JanelaPrincipal(QMainWindow):
         self._instante_anterior    = time.perf_counter()
 
         self.estado_rede = EstadoRede()
+        self.gerenciador_subredes = GerenciadorSubRedes()
         self.fila_eventos_ui: deque = deque(maxlen=500)
         self.eventos_mostrados_recentemente: deque = deque(maxlen=200)
 
-        # Thread pool para o motor pedagógico (background)
         self._thread_pool = QThreadPool.globalInstance()
         self._thread_pool.setMaxThreadCount(4)
         _sinal_pedagogico_global.resultado.connect(self._finalizar_exibicao_evento)
@@ -774,9 +700,9 @@ class JanelaPrincipal(QMainWindow):
         self._limite_hosts:       int   = _DescobrirDispositivosThread.MAX_HOSTS
         self._eh_wifi:            bool  = False
         self._periodo_timer_ms:   int   = 30000
+        self._mostrar_subredes:   bool  = False
 
-        # Timers internos
-        self.timer_consumir   = QTimer()
+        self.timer_consumir = QTimer()
         self.timer_consumir.timeout.connect(self._consumir_fila)
 
         self.timer_ui = QTimer()
@@ -784,6 +710,14 @@ class JanelaPrincipal(QMainWindow):
 
         self.timer_descoberta = QTimer()
         self.timer_descoberta.timeout.connect(self._descoberta_periodica)
+
+        self.timer_rotas = QTimer(self)
+        self.timer_rotas.timeout.connect(self._atualizar_subredes_rotas)
+        self.timer_rotas.start(120_000)
+
+        self.timer_arp_sistema = QTimer(self)
+        self.timer_arp_sistema.timeout.connect(self._popular_topologia_via_arp_sistema)
+        self.timer_arp_sistema.start(60_000)
 
         self.timer_eventos = QTimer()
         self.timer_eventos.timeout.connect(self._descarregar_eventos_ui)
@@ -796,7 +730,7 @@ class JanelaPrincipal(QMainWindow):
         self._criar_area_central()
 
     # -------------------------------------------------------------------------
-    # Configuração visual da janela
+    # Configuração visual
     # -------------------------------------------------------------------------
 
     def _configurar_janela(self):
@@ -861,6 +795,12 @@ class JanelaPrincipal(QMainWindow):
         btn_diag.clicked.connect(self._exibir_diagnostico_captura)
         barra.addWidget(btn_diag)
 
+        barra.addSeparator()
+        self.checkbox_subredes = QCheckBox("Mostrar sub-redes")
+        self.checkbox_subredes.setChecked(self._mostrar_subredes)
+        self.checkbox_subredes.toggled.connect(self._ao_alterar_visibilidade_subredes)
+        barra.addWidget(self.checkbox_subredes)
+
     def _criar_area_central(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -868,12 +808,16 @@ class JanelaPrincipal(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self.abas = QTabWidget()
+        # ── PATCH: lazy loading ao trocar de aba ──────────────────────────
+        self.abas.currentChanged.connect(self._ao_mudar_aba)
+        # ──────────────────────────────────────────────────────────────────
         layout.addWidget(self.abas)
 
         self.painel_topologia = PainelTopologia()
         self.painel_trafego   = PainelTrafego()
         self.painel_eventos   = PainelEventos()
         self.painel_servidor  = PainelServidor()
+        self.painel_topologia.definir_mostrar_subredes(self._mostrar_subredes)
 
         self.abas.addTab(self.painel_topologia, "Topologia da Rede")
         self.abas.addTab(self.painel_trafego,   "Tráfego em Tempo Real")
@@ -889,12 +833,34 @@ class JanelaPrincipal(QMainWindow):
         barra.addPermanentWidget(self.lbl_pacotes)
         barra.addPermanentWidget(self.lbl_dados)
 
+    @pyqtSlot(bool)
+    def _ao_alterar_visibilidade_subredes(self, mostrar: bool):
+        """Mostra ou oculta as sub-redes sem perder o estado da sessao."""
+        self._mostrar_subredes = bool(mostrar)
+        if hasattr(self, "painel_topologia"):
+            self.painel_topologia.definir_mostrar_subredes(self._mostrar_subredes)
+
+    # -------------------------------------------------------------------------
+    # Lazy loading ao trocar de aba
+    # -------------------------------------------------------------------------
+
+    @pyqtSlot(int)
+    def _ao_mudar_aba(self, idx: int):
+        """
+        PATCH v3.1: quando o usuário abre o Modo Análise, reaplicar os
+        filtros com o guard de chave ativo — reconstrói a lista apenas se
+        houve eventos novos desde a última vez que a aba ficou visível.
+        Isso elimina o freeze causado por centenas de widgets sendo
+        instanciados de uma só vez no momento da troca de aba.
+        """
+        if self.abas.widget(idx) is self.painel_eventos:
+            self.painel_eventos._reaplicar_filtros()
+
     # -------------------------------------------------------------------------
     # Detecção de interfaces e CIDR
     # -------------------------------------------------------------------------
 
     def _popular_interfaces(self):
-        """Popula o combo de interfaces usando o Scapy e seleciona a ativa."""
         self.combo_interface.clear()
         self._mapa_interface_nome.clear()
         self._mapa_interface_ip.clear()
@@ -924,7 +890,6 @@ class JanelaPrincipal(QMainWindow):
             ips      = iface.get('ips',      []) or []
             mascaras = iface.get('netmasks', []) or []
 
-            # Extrai o primeiro IPv4 válido da interface
             ip_v4 = next((
                 ip for ip in ips
                 if ip and ip.count('.') == 3
@@ -933,27 +898,20 @@ class JanelaPrincipal(QMainWindow):
 
             if ip_v4:
                 self._mapa_interface_ip[desc] = ip_v4
-
-                # Tenta alinhar máscara pelo índice correspondente ao IPv4
-                # (ips e netmasks devem estar alinhados no Scapy)
                 try:
                     idx = ips.index(ip_v4)
                     if idx < len(mascaras):
                         candidato = mascaras[idx]
-                        # Aceita apenas se parece uma máscara IPv4 (não prefixo IPv6)
                         if candidato and '.' in str(candidato):
                             self._mapa_interface_mascara[desc] = str(candidato)
                 except Exception:
                     pass
-
-                # Segundo: percorre as máscaras buscando a que parece IPv4
                 if desc not in self._mapa_interface_mascara:
                     for mask_candidata in mascaras:
                         if mask_candidata and '.' in str(mask_candidata):
                             self._mapa_interface_mascara[desc] = str(mask_candidata)
                             break
 
-            # Terceiro: tenta campo escalar 'netmask' ou 'mask'
             if desc not in self._mapa_interface_mascara:
                 for campo in ('netmask', 'mask'):
                     v = iface.get(campo)
@@ -961,7 +919,6 @@ class JanelaPrincipal(QMainWindow):
                         self._mapa_interface_mascara[desc] = str(v)
                         break
 
-        # Seleciona automaticamente a interface com o IP local ativo
         ip_local = obter_ip_local()
         if ip_local:
             for iface in interfaces_raw:
@@ -977,7 +934,6 @@ class JanelaPrincipal(QMainWindow):
             self.combo_interface.setCurrentIndex(0)
 
     def _selecionar_interface_fallback(self):
-        """Seleciona a interface padrão do Scapy quando o mapeamento falha."""
         try:
             from scapy.all import conf
             default = str(conf.iface)
@@ -990,25 +946,13 @@ class JanelaPrincipal(QMainWindow):
 
     @staticmethod
     def _mascara_para_prefixo(mascara: str) -> int:
-        """Converte uma máscara de sub-rede (ex.: 255.255.255.0) para prefixo CIDR."""
         try:
             return sum(bin(int(p)).count("1") for p in mascara.split("."))
         except Exception:
             return 24
 
-    # -------------------------------------------------------------------------
-    # CORREÇÃO [1]: Detecção de CIDR via ipconfig usando IP (não nome)
-    # -------------------------------------------------------------------------
-
     @staticmethod
     def _detectar_cidr_via_powershell(ip_local: str) -> str:
-        """
-        Usa Get-NetIPAddress do PowerShell para obter o prefixo CIDR.
-
-        Funciona em Windows 8+ independente do idioma do sistema operacional
-        (sem depender de strings localizadas como 'Máscara de Sub-rede').
-        Retorna a rede no formato '192.168.1.0/24' ou '' em caso de falha.
-        """
         if not ip_local:
             return ""
         try:
@@ -1035,14 +979,6 @@ class JanelaPrincipal(QMainWindow):
         return ""
 
     def _obter_cidr_via_ipconfig(self, ip_local: str) -> str:
-        """
-        Lê 'ipconfig /all' como bytes e tenta múltiplos encodings.
-
-        O cmd.exe no Windows pt-BR usa cp850; usar text=True + utf-8 corrompe
-        os caracteres acentuados ('Máscara' → lixo) e o regex nunca casa.
-        Esta versão lê bytes brutos e tenta cp850, cp1252, utf-8 e latin-1.
-        Também normaliza CRLF → LF antes de parsear.
-        """
         if not ip_local:
             return ""
         try:
@@ -1052,8 +988,7 @@ class JanelaPrincipal(QMainWindow):
                 timeout=10,
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
-            raw = proc.stdout  # bytes — não decodificamos ainda
-
+            raw  = proc.stdout
             saida = ""
             for enc in ("cp850", "cp1252", "utf-8", "latin-1"):
                 try:
@@ -1064,20 +999,12 @@ class JanelaPrincipal(QMainWindow):
             if not saida:
                 saida = raw.decode("utf-8", errors="replace")
 
-            # Normaliza quebras de linha do Windows (CRLF → LF)
             saida = saida.replace("\r\n", "\n").replace("\r", "\n")
-
-            # Localiza o IP na saída
-            idx = saida.find(ip_local)
+            idx   = saida.find(ip_local)
             if idx == -1:
                 return ""
 
-            # Janela de contexto: 400 chars antes + 700 depois do IP
-            # (garante que o bloco do adaptador que contém o IP seja capturado)
             trecho = saida[max(0, idx - 400): idx + 700]
-
-            # Regex genérico: aceita pt-BR, en-US e qualquer variação
-            # Captura qualquer linha com "Mask" ou "Mascara" seguida de um IP
             m = re.search(
                 r"(?:M[aá]scara[^:]*|Subnet\s+Mask)[^:]*:\s*"
                 r"((?:25[0-5]|2[0-4]\d|[01]?\d\d?)(?:\.(?:25[0-5]|2[0-4]\d|[01]?\d\d?)){3})",
@@ -1087,7 +1014,7 @@ class JanelaPrincipal(QMainWindow):
             if m:
                 mascara = m.group(1)
                 prefixo = sum(bin(int(p)).count("1") for p in mascara.split("."))
-                rede = ipaddress.ip_network(f"{ip_local}/{prefixo}", strict=False)
+                rede    = ipaddress.ip_network(f"{ip_local}/{prefixo}", strict=False)
                 return str(rede)
 
         except Exception as e:
@@ -1096,7 +1023,6 @@ class JanelaPrincipal(QMainWindow):
 
     @staticmethod
     def _detectar_cidr_via_scapy(nome_interface: str) -> str:
-        """Tenta detectar o CIDR diretamente via Scapy (get_if_addr/netmask)."""
         try:
             from scapy.all import get_if_addr, get_if_netmask
             ip      = get_if_addr(nome_interface)
@@ -1110,33 +1036,20 @@ class JanelaPrincipal(QMainWindow):
         return ""
 
     def _cidr_da_interface(self, desc: str) -> str:
-        """
-        Detecta o CIDR da interface em ordem decrescente de confiabilidade.
-
-        1. PowerShell Get-NetIPAddress  — independente de idioma, Windows 8+
-        2. ipconfig /all bytes+cp850    — corrige encoding pt-BR
-        3. Scapy mapeamento + máscara   — quando Scapy preenche netmasks
-        4. Scapy get_if_addr/netmask    — chamada direta por nome de dispositivo
-        5. Fallback /32                 — RESTRITIVO: só o próprio host é "local"
-           (nunca mais /24 estimado — isso era a causa dos 50 dispositivos falsos)
-        """
         ip_interface = self._mapa_interface_ip.get(desc, "") or obter_ip_local()
         if not ip_interface or ip_interface == "127.0.0.1":
             return ""
 
-        # 1) PowerShell — mais confiável no Windows moderno (independe de idioma)
         cidr = self._detectar_cidr_via_powershell(ip_interface)
         if cidr:
             self._status(f"✅ CIDR via PowerShell: {cidr}")
             return cidr
 
-        # 2) ipconfig /all com encoding correto (cp850 para pt-BR)
         cidr = self._obter_cidr_via_ipconfig(ip_interface)
         if cidr:
             self._status(f"✅ CIDR via ipconfig: {cidr}")
             return cidr
 
-        # 3) Mapeamento interno do Scapy + máscara
         mascara = self._mapa_interface_mascara.get(desc, "")
         if mascara and '.' in mascara:
             try:
@@ -1147,29 +1060,21 @@ class JanelaPrincipal(QMainWindow):
             except Exception:
                 pass
 
-        # 4) Scapy direto pelo nome do dispositivo NPF
         nome_dispositivo = self._mapa_interface_nome.get(desc, desc)
         cidr = self._detectar_cidr_via_scapy(nome_dispositivo)
         if cidr:
             self._status(f"✅ CIDR via Scapy direto: {cidr}")
             return cidr
 
-        # 5) Fallback restritivo /32 — NUNCA mais /24 estimado
         rede_restrita = f"{ip_interface}/32"
         self._status(
             f"⚠ Máscara não detectada para '{desc}'. "
             f"Usando /32 ({rede_restrita}). "
-            f"Apenas este computador aparecerá como local; todos os outros "
-            f"como 'Internet'. Verifique a instalação do Npcap."
+            f"Apenas este computador aparecerá como local."
         )
         return rede_restrita
 
     def _parametros_iface_seguro(self, nome_iface: str) -> dict:
-        """
-        Retorna parâmetros de varredura adequados para o tipo de interface.
-        Wi-Fi recebe configurações mais conservadoras para não sobrecarregar
-        o ponto de acesso.
-        """
         nome_lower = (nome_iface or "").lower()
         eh_wifi = any(
             p in nome_lower
@@ -1190,21 +1095,108 @@ class JanelaPrincipal(QMainWindow):
         }
 
         if eh_wifi:
-            # Wi-Fi: mais lento, menos tentativas, ICMP desativado
             base.update({
                 "batch":          8,
                 "sleep_lote":     0.25,
                 "pausa":          3.0,
-                "timeout":        2.8,
-                "tentativas":     1,
+                "timeout":        3.5,
+                "tentativas":     2,
                 "desativar_icmp": True,
-                "timer_ms":       300_000,   # Re-varredura a cada 5 min
+                "timer_ms":       300_000,
             })
 
         return base
 
+    def _sincronizar_subredes_topologia(self):
+        """Envia ao painel a fotografia atual das sub-redes conhecidas."""
+        self.painel_topologia.atualizar_subredes(
+            self.gerenciador_subredes.todas_subredes()
+        )
+
+    def _registrar_subrede_local(self):
+        """
+        Registra a sub-rede da interface ativa sem alargar o escopo artificialmente.
+
+        Se o CIDR nao puder ser determinado com seguranca, o projeto ja usa /32.
+        Mantemos esse comportamento para preservar a honestidade da topologia.
+        """
+        if not self._cidr_captura:
+            return
+
+        try:
+            rede_local = ipaddress.ip_network(self._cidr_captura, strict=False)
+        except ValueError:
+            return
+
+        gateway_candidato = None
+        if rede_local.num_addresses > 2:
+            try:
+                gateway_candidato = str(rede_local.network_address + 1)
+            except Exception:
+                gateway_candidato = None
+
+        self.gerenciador_subredes.adicionar_subrede(
+            self._cidr_captura,
+            gateway=gateway_candidato,
+            visibilidade=Visibilidade.PARCIAL,
+            local=True,
+        )
+        self._sincronizar_subredes_topologia()
+
+    def _registrar_host_confirmado(
+        self,
+        ip: str,
+        mac: str,
+        hostname: str = "",
+        confirmado_por_arp: bool = False,
+        atualizar_subredes: bool = True,
+        cidr_forcado: str = "",
+    ) -> bool:
+        """
+        Registra um host observado sem criar evidencias artificiais.
+
+        Retorna True quando houve mudanca de hosts/visibilidade em alguma sub-rede.
+        """
+        if not ip or not _ip_eh_topologizavel(ip):
+            return False
+
+        subrede = None
+        eh_local = False
+        if cidr_forcado:
+            subrede_forcada = self.gerenciador_subredes.subredes.get(cidr_forcado)
+            if subrede_forcada and subrede_forcada.contem(ip):
+                subrede = subrede_forcada
+                eh_local = (subrede.cidr == self.gerenciador_subredes._cidr_local())
+
+        if subrede is None:
+            subrede, eh_local = self.gerenciador_subredes.classificar_ip(ip)
+        houve_alteracao = False
+
+        if subrede:
+            total_hosts_antes = len(subrede.hosts)
+            visibilidade_antes = subrede.visibilidade
+
+            subrede.adicionar_host(ip, confirmado=confirmado_por_arp)
+            self.painel_topologia.adicionar_dispositivo_com_subrede(
+                ip, mac, subrede.cidr, eh_local, hostname, confirmado_por_arp
+            )
+
+            houve_alteracao = (
+                len(subrede.hosts) != total_hosts_antes
+                or subrede.visibilidade != visibilidade_antes
+            )
+            if houve_alteracao and atualizar_subredes:
+                self._sincronizar_subredes_topologia()
+            return houve_alteracao
+
+        if confirmado_por_arp:
+            self.painel_topologia.adicionar_dispositivo_manual(ip, mac, hostname)
+        else:
+            self.painel_topologia.adicionar_dispositivo(ip, mac, hostname)
+
+        return False
+
     def _gerar_historias(self) -> list:
-        """Gera resumos textuais dos domínios mais acessados (para Insights)."""
         top_dns = (
             self.analisador.obter_top_dns()
             if hasattr(self.analisador, "obter_top_dns") else []
@@ -1227,10 +1219,6 @@ class JanelaPrincipal(QMainWindow):
             self._iniciar_captura()
 
     def _validar_pre_captura(self, nome_dispositivo: str):
-        """
-        Valida privilégios administrativos e disponibilidade do Npcap/Scapy
-        antes de iniciar a captura.
-        """
         try:
             if hasattr(ctypes, "windll") and not ctypes.windll.shell32.IsUserAnAdmin():
                 raise PermissionError(
@@ -1243,8 +1231,8 @@ class JanelaPrincipal(QMainWindow):
 
         try:
             from scapy.arch.windows import get_windows_if_list
-            adaptadores     = get_windows_if_list()
-            nomes_validos   = (
+            adaptadores   = get_windows_if_list()
+            nomes_validos = (
                 {a.get("name") for a in adaptadores}
                 | {a.get("description") for a in adaptadores}
             )
@@ -1263,7 +1251,6 @@ class JanelaPrincipal(QMainWindow):
             raise RuntimeError(f"Falha ao acessar o Npcap/Scapy: {exc}") from exc
 
     def _limpar_pos_falha(self):
-        """Restaura o estado da UI após uma falha ao iniciar a captura."""
         self.timer_consumir.stop()
         self.timer_ui.stop()
         self.timer_descoberta.stop()
@@ -1283,11 +1270,6 @@ class JanelaPrincipal(QMainWindow):
         self.acao_captura.setText("Iniciar Captura")
 
     def _iniciar_captura(self):
-        """
-        Inicia a captura de pacotes na interface selecionada.
-        Realiza validação, configura filas e timers, e dispara a varredura
-        inicial da rede local.
-        """
         desc_sel = self.combo_interface.currentText()
         if not desc_sel or "nenhuma" in desc_sel.lower():
             QMessageBox.warning(
@@ -1307,12 +1289,11 @@ class JanelaPrincipal(QMainWindow):
             self._limpar_pos_falha()
             return
 
-        # Detecta CIDR com todos os fallbacks disponíveis
         self._interface_captura = nome_dispositivo
         self._cidr_captura      = self._cidr_da_interface(desc_sel)
         self.painel_topologia.definir_rede_local(self._cidr_captura)
+        self._registrar_subrede_local()
 
-        # Parâmetros adaptados ao tipo de interface (Ethernet × Wi-Fi)
         self._param_arps       = self._parametros_iface_seguro(self._interface_captura)
         self._periodo_timer_ms = self._param_arps.get("timer_ms", 30000)
         self._eh_wifi          = self._param_arps.get("wifi", False)
@@ -1320,7 +1301,6 @@ class JanelaPrincipal(QMainWindow):
             "limite_hosts", _DescobrirDispositivosThread.MAX_HOSTS
         )
 
-        # Reinicia filas e estatísticas
         fila_pacotes_global.limpar()
         self.analisador.resetar()
         self._snapshot_atual = {
@@ -1331,10 +1311,8 @@ class JanelaPrincipal(QMainWindow):
         self._bytes_total_anterior = 0
         self._instante_anterior    = time.perf_counter()
 
-        # Inicia a thread de análise (background)
         self.analisador.iniciar_thread()
 
-        # Inicia o sniffer
         try:
             self.capturador = _CapturadorPacotesThread(interface=nome_dispositivo)
             self.capturador.erro_ocorrido.connect(self._ao_ocorrer_erro)
@@ -1347,16 +1325,10 @@ class JanelaPrincipal(QMainWindow):
             self._limpar_pos_falha()
             return
 
-        # Ativa timers principais
         self.timer_consumir.start(250)
         self.timer_ui.start(1000)
-
-        # CORREÇÃO [3]: ativa o timer de descoberta periódica
-        # Antes essa linha estava ausente, então a rede nunca era
-        # re-varrida automaticamente após a varredura inicial.
         self.timer_descoberta.start(self._periodo_timer_ms)
 
-        # Atualiza botões e status
         self.em_captura = True
         self.botao_captura.setText("Parar Captura")
         self.botao_captura.setObjectName("botao_parar")
@@ -1368,12 +1340,11 @@ class JanelaPrincipal(QMainWindow):
             f"Capturando em: {desc_sel} (dispositivo: {nome_dispositivo}){rede_info}"
         )
 
-        # Dispara varreduras iniciais com pequeno atraso para aguardar o sniffer
-        QTimer.singleShot(4000,  self._varredura_inicial_segura)
-        QTimer.singleShot(500,   self._popular_topologia_via_arp_sistema)
+        self._atualizar_subredes_rotas()
+        QTimer.singleShot(4000, self._varredura_inicial_segura)
+        QTimer.singleShot(500,  self._popular_topologia_via_arp_sistema)
 
     def _parar_captura(self):
-        """Para todos os timers, o sniffer e a thread de análise."""
         self.timer_consumir.stop()
         self.timer_ui.stop()
         self.timer_descoberta.stop()
@@ -1396,7 +1367,6 @@ class JanelaPrincipal(QMainWindow):
 
     @staticmethod
     def _repolir(botao: QPushButton):
-        """Força o Qt a reaplicar o stylesheet após trocar objectName."""
         botao.style().unpolish(botao)
         botao.style().polish(botao)
 
@@ -1406,21 +1376,11 @@ class JanelaPrincipal(QMainWindow):
 
     @pyqtSlot()
     def _consumir_fila(self):
-        """
-        Transfere pacotes da fila global para o analisador e coleta os
-        eventos resultantes para exibição na UI.
-
-        REGRA DE OURO (não alterar):
-          • Apenas ip_origem com MAC válido cria nó na topologia.
-          • ip_destino NUNCA cria nó — só atualiza conexão.
-          • Conexão só é desenhada se os dois endpoints já existirem.
-        """
-        # ── 1. Transfere pacotes brutos para o analisador (thread separada) ──
         for dados in fila_pacotes_global.consumir_todos():
             self.analisador.enfileirar(dados)
 
-        # ── 2. Coleta eventos já processados pelo analisador ──────────────────
         eventos, _ = self.analisador.coletar_resultados()
+        subredes_alteradas = False
 
         for evento in eventos:
             ip_origem  = evento.get("ip_origem",  "")
@@ -1428,19 +1388,22 @@ class JanelaPrincipal(QMainWindow):
             mac_origem = evento.get("mac_origem", "")
             tipo       = evento.get("tipo",       "")
 
-            # [FIX-2] Valida se o MAC de origem é real (não broadcast/nulo)
             mac_e_valido = (
                 mac_origem
                 and mac_origem not in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00", "")
             )
 
-            # [FIX-1] Apenas ip_origem com MAC válido adiciona dispositivo.
-            #         ip_destino JAMAIS cria nó — regra estrutural.
             if ip_origem and _ip_eh_topologizavel(ip_origem) and mac_e_valido:
-                self.painel_topologia.adicionar_dispositivo(ip_origem, mac_origem)
+                subredes_alteradas = (
+                    self._registrar_host_confirmado(
+                        ip=ip_origem,
+                        mac=mac_origem,
+                        confirmado_por_arp=(tipo == "ARP"),
+                        atualizar_subredes=False,
+                    )
+                    or subredes_alteradas
+                )
 
-            # [FIX-3] Conexão só é adicionada; destino NÃO cria nó implicitamente.
-            #         O painel_topologia.adicionar_conexao() já trata isso internamente.
             if (
                 ip_origem and ip_destino
                 and _ip_eh_topologizavel(ip_origem)
@@ -1448,7 +1411,6 @@ class JanelaPrincipal(QMainWindow):
             ):
                 self.painel_topologia.adicionar_conexao(ip_origem, ip_destino)
 
-            # ── Enfileira evento para exibição pedagógica (com cooldown) ──────
             if tipo:
                 if tipo == "NOVO_DISPOSITIVO":
                     if ip_origem:
@@ -1476,7 +1438,9 @@ class JanelaPrincipal(QMainWindow):
                         if self.estado_rede.deve_emitir_evento(chave, cooldown=5):
                             self.fila_eventos_ui.append(evento)
 
-        # ── 3. Atualiza snapshot para o próximo ciclo da UI ───────────────────
+        if subredes_alteradas:
+            self._sincronizar_subredes_topologia()
+
         self._snapshot_atual = {
             "total_bytes":        self.analisador.total_bytes,
             "total_pacotes":      self.analisador.total_pacotes,
@@ -1488,18 +1452,12 @@ class JanelaPrincipal(QMainWindow):
         }
 
     def _agregar_eventos(self, eventos: list) -> list:
-        """
-        Agrupa eventos repetidos do mesmo tipo+fluxo para evitar que a
-        lista fique sobrecarregada com duplicatas. HTTP e HTTPS sempre
-        são exibidos individualmente.
-        """
         agregados: dict = {}
         resultado: list = []
         for ev in eventos:
             if ev.get("tipo") in ("HTTP", "HTTPS"):
                 resultado.append(ev)
                 continue
-
             chave = (
                 ev.get("tipo"),
                 ev.get("ip_origem"),
@@ -1519,13 +1477,24 @@ class JanelaPrincipal(QMainWindow):
     @pyqtSlot()
     def _descarregar_eventos_ui(self):
         """
-        Timer a cada 2s: descarrega a fila de eventos para o motor
-        pedagógico, evitando duplicatas visuais recentes.
+        Timer a cada 2s: descarrega a fila de eventos para o motor pedagógico.
+
+        PATCH v3.1 — backpressure:
+          Limita a 8 eventos por ciclo (descarta os mais antigos se a fila
+          acumulou mais). Em redes movimentadas, o cooldown em _consumir_fila
+          já filtra duplicatas; descartar eventos antigos é aceitável e
+          previne que a UI thread seja sobrecarregada.
         """
         if not self.fila_eventos_ui:
             return
+
         lote = list(self.fila_eventos_ui)
         self.fila_eventos_ui.clear()
+
+        # ── Backpressure: máx 8 eventos por ciclo de 2s ──────────────────
+        lote = lote[-8:]
+        # ──────────────────────────────────────────────────────────────────
+
         for ev in self._agregar_eventos(lote):
             tipo = ev.get("tipo", "")
             if tipo in ("HTTP", "HTTPS"):
@@ -1547,10 +1516,6 @@ class JanelaPrincipal(QMainWindow):
 
     @pyqtSlot()
     def _atualizar_ui_por_segundo(self):
-        """
-        Timer a cada 1s: calcula taxa de transferência (KB/s) com EMA
-        e atualiza gráfico, tabelas e barra de status.
-        """
         snap          = self._snapshot_atual
         total_bytes   = snap.get("total_bytes",   0)
         total_pacotes = snap.get("total_pacotes", 0)
@@ -1560,7 +1525,6 @@ class JanelaPrincipal(QMainWindow):
         delta_b = max(0, total_bytes - self._bytes_total_anterior)
         kb_raw  = (delta_b / 1024.0) / delta_t
 
-        # EMA com alpha = 0.3 para suavizar picos momentâneos
         alpha         = 0.3
         kb_por_s      = alpha * kb_raw + (1.0 - alpha) * self._kb_anterior
         self._kb_anterior = kb_por_s
@@ -1583,7 +1547,6 @@ class JanelaPrincipal(QMainWindow):
             snap.get("historias", []),
         )
 
-        # Atualiza barra de status
         kb = total_bytes / 1024
         self.lbl_pacotes.setText(f"Pacotes: {total_pacotes:,}")
         self.lbl_dados.setText(
@@ -1592,39 +1555,24 @@ class JanelaPrincipal(QMainWindow):
         )
 
     # -------------------------------------------------------------------------
-    # Motor pedagógico — exibição de eventos em background
+    # Motor pedagógico
     # -------------------------------------------------------------------------
 
     def _exibir_evento_pedagogico(self, evento: dict):
-        """Enfileira a geração de explicação no thread pool."""
         runnable = _WorkerRunnable(evento, self.motor_pedagogico)
         self._thread_pool.start(runnable)
 
     def _finalizar_exibicao_evento(self, explicacao: dict):
-        """Recebe o resultado do worker e exibe no painel de eventos."""
         self.painel_eventos.adicionar_evento(explicacao)
 
     def _finalizar_workers(self):
-        """Aguarda a conclusão de todos os workers pedagógicos pendentes."""
         self._thread_pool.waitForDone(3000)
 
     # -------------------------------------------------------------------------
-    # Descoberta de dispositivos — varredura ativa e passiva
+    # Descoberta de dispositivos
     # -------------------------------------------------------------------------
 
     def _varredura_inicial_segura(self):
-        """
-        CORREÇÃO [2]: limite ampliado de 30 para min(500, self._limite_hosts).
-
-        A versão anterior limitava a varredura inicial a apenas 30 hosts,
-        o que deixava a topologia quase vazia nos primeiros minutos.
-        Agora usamos um limite proporcional ao perfil da interface
-        (Ethernet permite mais, Wi-Fi mantém restrição para não
-        sobrecarregar o ponto de acesso).
-
-        Parâmetros leves são mantidos (timeout curto, 1 tentativa, sem ICMP)
-        para que a varredura seja rápida e não interfira no tráfego normal.
-        """
         if not self.em_captura or not self._interface_captura:
             return
         if self.descoberta_rodando or (
@@ -1632,7 +1580,8 @@ class JanelaPrincipal(QMainWindow):
         ):
             return
 
-        # Limite ampliado: até 500 hosts em Ethernet, mantém o do Wi-Fi
+        cidr_local = self.gerenciador_subredes._cidr_local()
+        cidr_varredura = cidr_local if cidr_local else self._cidr_captura
         limite_inicial = min(500, self._limite_hosts)
 
         parametros_leves = {
@@ -1651,12 +1600,12 @@ class JanelaPrincipal(QMainWindow):
         self.descoberta_rodando = True
         self._status(
             f"🔍 Varredura inicial: descobrindo até {limite_inicial} "
-            f"dispositivo(s) na rede {self._cidr_captura or 'local'}…"
+            f"dispositivo(s) na rede {cidr_varredura or 'local'}…"
         )
 
         self.descobridor = _DescobrirDispositivosThread(
             interface=self._interface_captura,
-            cidr=self._cidr_captura,
+            cidr=cidr_varredura,
             parametros=parametros_leves,
         )
         self.descobridor.dispositivo_encontrado.connect(self._ao_encontrar_dispositivo)
@@ -1676,22 +1625,34 @@ class JanelaPrincipal(QMainWindow):
 
     @pyqtSlot(str)
     def _ao_erro_varredura_silencioso(self, mensagem: str):
-        """Erros na varredura inicial são registrados no status sem popup."""
         self._status(f"⚠ Varredura: {mensagem[:80]}")
         self.descoberta_rodando = False
 
     def _popular_topologia_via_arp_sistema(self):
-        """
-        Importa dispositivos já conhecidos da tabela ARP do sistema operacional
-        para a topologia (sem varredura ativa — usa o cache do SO).
-        """
+        if not self.em_captura:
+            return
+
         entradas    = self._obter_tabela_arp_sistema()
         adicionados = 0
+        subredes_alteradas = False
+        cidr_local = self.gerenciador_subredes._cidr_local() or self._cidr_captura
         for entrada in entradas:
-            self.painel_topologia.adicionar_dispositivo_manual(
-                entrada["ip"], entrada["mac"]
+            if not _ip_eh_topologizavel(entrada["ip"]):
+                continue
+            subredes_alteradas = (
+                self._registrar_host_confirmado(
+                    ip=entrada["ip"],
+                    mac=entrada["mac"],
+                    confirmado_por_arp=True,
+                    atualizar_subredes=False,
+                    cidr_forcado=cidr_local,
+                )
+                or subredes_alteradas
             )
             adicionados += 1
+
+        if subredes_alteradas:
+            self._sincronizar_subredes_topologia()
 
         if adicionados:
             self._status(
@@ -1699,15 +1660,24 @@ class JanelaPrincipal(QMainWindow):
                 f"importado(s) para a topologia."
             )
 
+    def _atualizar_subredes_rotas(self):
+        """Atualiza segmentos inferidos via tabela de rotas."""
+        if not self.em_captura:
+            return
+
+        novas = self.gerenciador_subredes.detectar_subredes_via_rotas()
+        if not novas:
+            return
+
+        self._sincronizar_subredes_topologia()
+        self._status(
+            f"🌐 {len(novas)} nova(s) sub-rede(s) inferida(s) via tabela de rotas."
+        )
+
     @staticmethod
     def _obter_tabela_arp_sistema() -> list:
-        """
-        Lê a tabela ARP do SO (arp -a no Windows, ip neigh no Linux/macOS).
-        Retorna lista de dicts com 'ip', 'mac' e 'tipo'.
-        """
         import platform
         entradas = []
-
         try:
             if platform.system() == "Windows":
                 saida = subprocess.check_output(
@@ -1736,10 +1706,8 @@ class JanelaPrincipal(QMainWindow):
                 ip_arp  = corr.group(1)
                 mac_arp = corr.group(2).replace("-", ":").lower()
                 tipo    = corr.group(3)
-
                 if mac_arp in ("ff:ff:ff:ff:ff:ff", "00:00:00:00:00:00"):
                     continue
-
                 entradas.append({"ip": ip_arp, "mac": mac_arp, "tipo": tipo})
 
         except Exception:
@@ -1748,10 +1716,6 @@ class JanelaPrincipal(QMainWindow):
         return entradas
 
     def _descoberta_periodica(self):
-        """
-        Slot do timer_descoberta: re-varre a rede periodicamente para
-        manter a topologia atualizada com dispositivos que entram e saem.
-        """
         if not self.em_captura:
             return
         if self.descoberta_rodando or (
@@ -1761,12 +1725,17 @@ class JanelaPrincipal(QMainWindow):
         if not self._interface_captura:
             return
 
+        cidr_local = self.gerenciador_subredes._cidr_local()
+        cidr_varredura = cidr_local if cidr_local else self._cidr_captura
+
         self.descoberta_rodando = True
-        self._status("🔄 Varrendo a rede local em busca de dispositivos…")
+        self._status(
+            f"🔄 Varrendo a rede local em busca de dispositivos em {cidr_varredura or 'local'}…"
+        )
 
         self.descobridor = _DescobrirDispositivosThread(
             interface=self._interface_captura,
-            cidr=self._cidr_captura,
+            cidr=cidr_varredura,
             parametros=self._param_arps,
         )
         self.descobridor.dispositivo_encontrado.connect(self._ao_encontrar_dispositivo)
@@ -1777,17 +1746,14 @@ class JanelaPrincipal(QMainWindow):
 
     @pyqtSlot(str, str, str)
     def _ao_encontrar_dispositivo(self, ip: str, mac: str, hostname: str):
-        """
-        Slot chamado pela thread de varredura ARP ativa.
-        Apenas dispositivos com MAC válido chegam aqui (filtrado no thread).
-        """
         if not _ip_eh_topologizavel(ip):
             return
-
-        # adicionar_dispositivo_manual → confirmado_por_arp=True internamente
-        self.painel_topologia.adicionar_dispositivo_manual(ip, mac, hostname)
-
-        # Agenda evento pedagógico de novo dispositivo
+        self._registrar_host_confirmado(
+            ip=ip,
+            mac=mac,
+            hostname=hostname,
+            confirmado_por_arp=True,
+        )
         self.fila_eventos_ui.append({
             "tipo":       "NOVO_DISPOSITIVO",
             "ip_origem":  ip,
@@ -1805,15 +1771,20 @@ class JanelaPrincipal(QMainWindow):
         self.descoberta_rodando = False
 
     # -------------------------------------------------------------------------
-    # Diagnóstico da captura
+    # Diagnóstico
     # -------------------------------------------------------------------------
 
     def _exibir_diagnostico_captura(self):
-        """Exibe um popup com informações detalhadas sobre a sessão atual."""
         desc_sel         = self.combo_interface.currentText()
         nome_dispositivo = self._mapa_interface_nome.get(desc_sel, desc_sel)
         ip_local         = self._mapa_interface_ip.get(desc_sel, obter_ip_local())
-        mascara          = self._mapa_interface_mascara.get(desc_sel, "Não detectada")
+        mascara          = self._mapa_interface_mascara.get(desc_sel, "")
+        if self._cidr_captura:
+            try:
+                mascara = str(ipaddress.ip_network(self._cidr_captura, strict=False).netmask)
+            except Exception:
+                pass
+        mascara = mascara or "Não detectada"
         cidr             = self._cidr_captura or "Não definido"
         total_local      = self.painel_topologia.total_dispositivos()
 
@@ -1872,7 +1843,7 @@ class JanelaPrincipal(QMainWindow):
         dialogo.exec()
 
     # -------------------------------------------------------------------------
-    # Tratamento de erros e ações gerais
+    # Erros e ações gerais
     # -------------------------------------------------------------------------
 
     @pyqtSlot(str)
@@ -1884,11 +1855,11 @@ class JanelaPrincipal(QMainWindow):
         self.descoberta_rodando = False
 
     def _nova_sessao(self):
-        """Reinicia completamente a sessão, limpando dados e painéis."""
         self._finalizar_workers()
         if self.em_captura:
             self._parar_captura()
         self.analisador.resetar()
+        self.gerenciador_subredes.limpar()
         self.painel_topologia.limpar()
         self.painel_topologia.definir_rede_local(self._cidr_captura)
         self.painel_trafego.limpar()
@@ -1903,7 +1874,6 @@ class JanelaPrincipal(QMainWindow):
         self._status("Nova sessão iniciada. Pronto para capturar.")
 
     def _status(self, mensagem: str):
-        """Exibe uma mensagem na barra de status da janela principal."""
         self.lbl_status.setText(mensagem)
 
     def _exibir_sobre(self):
@@ -1919,13 +1889,12 @@ class JanelaPrincipal(QMainWindow):
             "<p><b>Tecnologias:</b> Python · PyQt6 · Scapy · PyQtGraph</p>"
             "<p><b>Destaques:</b> DPI, detecção de dados sensíveis, "
             "identificação via MAC/OUI e monitoramento em tempo real.</p>"
-            "<p><b>Autor:</b>Yuri Gonçalves Pavão</p>"
+            "<p><b>Autor:</b> Yuri Gonçalves Pavão</p>"
             "<p><b>Instagram:</b> @yuri_g0n | "
             "<b>GitHub:</b> github.com/yurigonpav</p>"
         )
 
     def closeEvent(self, evento):
-        """Garante limpeza de recursos ao fechar a janela."""
         self._finalizar_workers()
         if self.em_captura:
             self._parar_captura()
