@@ -25,7 +25,7 @@ from PyQt6.QtGui import (
     QPainter, QPen, QBrush, QColor, QFont,
     QRadialGradient, QCursor, QPainterPath, QFontMetrics
 )
-from utils.rede import obter_ip_local, eh_ip_local, eh_endereco_valido
+from utils.rede import obter_ip_local, eh_endereco_valido
 
 
 # ── Helpers de endereço ───────────────────────────────────────────────────────
@@ -415,20 +415,27 @@ class VisualizadorTopologia(QWidget):
 
     def _pertence_rede(self, ip: str) -> bool:
         """
-        Verifica se um IP pertence à rede local exata (sub-rede da interface).
-        Qualquer IP fora da sub-rede é tratado como "internet".
+        Verifica se um IP pertence à sub-rede física da interface capturada.
+
+        Regra de decisão:
+          • CIDR configurado  → ipaddress puro, sem ambiguidade.
+          • CIDR ausente      → aceita APENAS o IP do próprio host (_ip_local).
+            Isso é deliberadamente restritivo: evita que endereços de VMs,
+            VPNs, adaptadores virtuais (Docker, Hyper-V, VMware) sejam
+            classificados como dispositivos da LAN física enquanto o CIDR
+            ainda não foi resolvido.
         """
         if not ip or not eh_endereco_valido(ip):
             return False
-        
-        # Se nenhuma rede foi definida, usa fallback (eh_ip_local)
-        if self._rede_local is None:
-            return eh_ip_local(ip)
-        
-        try:
-            return ipaddress.ip_address(ip) in self._rede_local
-        except Exception:
-            return False
+
+        if self._rede_local is not None:
+            try:
+                return ipaddress.ip_address(ip) in self._rede_local
+            except Exception:
+                return False
+
+        # Sem CIDR: somente o próprio host é "local"
+        return ip == self._ip_local
 
     # ── Desenho ────────────────────────────────────────────────────────────
 

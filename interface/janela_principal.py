@@ -45,6 +45,30 @@ from utils.rede import obter_ip_local
 # Estado da rede — cooldown de eventos e registro de dispositivos descobertos
 # ============================================================================
 
+def _ip_eh_topologizavel(ip: str) -> bool:
+    """
+    Retorna True apenas para IPs que devem aparecer na topologia.
+    Descartados: loopback, link-local, multicast, broadcast, rede zero.
+    """
+    if not ip:
+        return False
+    try:
+        partes = [int(p) for p in ip.split('.')]
+        if len(partes) != 4:
+            return False
+        a, b, _, d = partes
+        return not (
+            a == 0
+            or a == 127
+            or (a == 169 and b == 254)
+            or (224 <= a <= 239)
+            or ip == "255.255.255.255"
+            or d == 255
+        )
+    except Exception:
+        return False
+
+
 class EstadoRede:
     """
     Gerencia o cooldown entre eventos repetidos e o mapeamento de
@@ -911,23 +935,43 @@ class JanelaPrincipal(QMainWindow):
 
             ips      = iface.get('ips',      []) or []
             mascaras = iface.get('netmasks', []) or []
+
+            # Extrai o primeiro IPv4 válido da interface
             ip_v4 = next((
                 ip for ip in ips
                 if ip and ip.count('.') == 3
                 and not ip.startswith(("169.254", "127."))
             ), "")
+
             if ip_v4:
                 self._mapa_interface_ip[desc] = ip_v4
+
+                # Tenta alinhar máscara pelo índice correspondente ao IPv4
+                # (ips e netmasks devem estar alinhados no Scapy)
                 try:
                     idx = ips.index(ip_v4)
                     if idx < len(mascaras):
-                        self._mapa_interface_mascara[desc] = mascaras[idx]
+                        candidato = mascaras[idx]
+                        # Aceita apenas se parece uma máscara IPv4 (não prefixo IPv6)
+                        if candidato and '.' in str(candidato):
+                            self._mapa_interface_mascara[desc] = str(candidato)
                 except Exception:
                     pass
+
+                # Segundo: percorre as máscaras buscando a que parece IPv4
+                if desc not in self._mapa_interface_mascara:
+                    for mask_candidata in mascaras:
+                        if mask_candidata and '.' in str(mask_candidata):
+                            self._mapa_interface_mascara[desc] = str(mask_candidata)
+                            break
+
+            # Terceiro: tenta campo escalar 'netmask' ou 'mask'
             if desc not in self._mapa_interface_mascara:
-                mask = iface.get('netmask')
-                if mask:
-                    self._mapa_interface_mascara[desc] = mask
+                for campo in ('netmask', 'mask'):
+                    v = iface.get(campo)
+                    if v and '.' in str(v):
+                        self._mapa_interface_mascara[desc] = str(v)
+                        break
 
         # Seleciona automaticamente a interface com o IP local ativo
         ip_local = obter_ip_local()
@@ -968,96 +1012,99 @@ class JanelaPrincipal(QMainWindow):
     # CORREÇÃO [1]: Detecção de CIDR via ipconfig usando IP (não nome)
     # -------------------------------------------------------------------------
 
-    def _obter_cidr_via_ipconfig(self, ip_local: str) -> str:
+    @staticmethod
+    def _detectar_cidr_via_powershell(ip_local: str) -> str:
         """
-        Fallback definitivo para detecção de CIDR.
+        Usa Get-NetIPAddress do PowerShell para obter o prefixo CIDR.
 
-        CORREÇÃO: A versão anterior usava o nome da interface (ex.: "Realtek
-        PCIe GbE Family Controller") para localizar o bloco correto no ipconfig,
-        mas esse nome frequentemente diverge do que o Windows exibe.
-        Esta versão usa o endereço IPv4 da interface (que é único no sistema)
-        para encontrar o bloco correto de forma robusta e independente do idioma.
-
-        Parâmetros:
-            ip_local: endereço IPv4 da interface selecionada.
-
-        Retorna:
-            String CIDR (ex.: "192.168.1.0/24") ou "" em caso de falha.
+        Funciona em Windows 8+ independente do idioma do sistema operacional
+        (sem depender de strings localizadas como 'Máscara de Sub-rede').
+        Retorna a rede no formato '192.168.1.0/24' ou '' em caso de falha.
         """
         if not ip_local:
             return ""
-
         try:
-            resultado = subprocess.run(
-                ["ipconfig", "/all"],
+            proc = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-NonInteractive",
+                    "-Command",
+                    f"(Get-NetIPAddress -IPAddress '{ip_local}' "
+                    f"-AddressFamily IPv4 -ErrorAction SilentlyContinue)"
+                    f".PrefixLength",
+                ],
                 capture_output=True,
                 text=True,
-                encoding='utf-8',
-                errors='ignore',
-                timeout=10,
-                creationflags=subprocess.CREATE_NO_WINDOW
+                timeout=8,
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
-            saida = resultado.stdout
-
-            # Localiza o bloco do adaptador que contém exatamente este IPv4.
-            # A busca é por IP (único no sistema), não pelo nome do adaptador.
-            padrao_ip_no_bloco = re.compile(
-                r'((?:Adaptador|Adapter)[^\n]+(?:\n(?!Adaptador|Adapter)[^\n]*)*)',
-                re.IGNORECASE
-            )
-            bloco_correto = ""
-            for bloco in padrao_ip_no_bloco.finditer(saida):
-                texto_bloco = bloco.group(0)
-                # Verifica se este bloco contém o IP da interface selecionada
-                if re.search(
-                    re.escape(ip_local),
-                    texto_bloco,
-                    re.IGNORECASE
-                ):
-                    bloco_correto = texto_bloco
-                    break
-
-            if not bloco_correto:
-                # Segundo tentativa: busca direta pelo IP em qualquer posição
-                idx_ip = saida.find(ip_local)
-                if idx_ip == -1:
-                    return ""
-                # Localiza o início do bloco do adaptador acima do IP
-                inicio_bloco = saida.rfind('\n\n', 0, idx_ip)
-                inicio_bloco = inicio_bloco + 2 if inicio_bloco != -1 else 0
-                fim_bloco    = saida.find('\n\n', idx_ip)
-                fim_bloco    = fim_bloco if fim_bloco != -1 else len(saida)
-                bloco_correto = saida[inicio_bloco:fim_bloco]
-
-            if not bloco_correto:
-                return ""
-
-            # Extrai a máscara de sub-rede do bloco encontrado
-            # Suporta português e inglês (pt-BR e en-US)
-            padrao_mascara = re.compile(
-                r'(?:Máscara de Sub-rede|Subnet Mask)[.\s]*:\s*([\d.]+)',
-                re.IGNORECASE
-            )
-            correspondencia_mascara = padrao_mascara.search(bloco_correto)
-
-            if not correspondencia_mascara:
-                # Sem máscara: assume /24 baseado no IP local
-                partes = ip_local.split(".")
-                if len(partes) == 4:
-                    return f"{partes[0]}.{partes[1]}.{partes[2]}.0/24"
-                return ""
-
-            mascara = correspondencia_mascara.group(1)
-            try:
-                prefixo = sum(bin(int(p)).count("1") for p in mascara.split("."))
-                rede    = ipaddress.ip_network(f"{ip_local}/{prefixo}", strict=False)
+            saida = (proc.stdout or "").strip()
+            if saida.isdigit():
+                prefixo = int(saida)
+                rede = ipaddress.ip_network(f"{ip_local}/{prefixo}", strict=False)
                 return str(rede)
-            except Exception:
+        except Exception:
+            pass
+        return ""
+
+    def _obter_cidr_via_ipconfig(self, ip_local: str) -> str:
+        """
+        Lê 'ipconfig /all' como bytes e tenta múltiplos encodings.
+
+        O cmd.exe no Windows pt-BR usa cp850; usar text=True + utf-8 corrompe
+        os caracteres acentuados ('Máscara' → lixo) e o regex nunca casa.
+        Esta versão lê bytes brutos e tenta cp850, cp1252, utf-8 e latin-1.
+        Também normaliza CRLF → LF antes de parsear.
+        """
+        if not ip_local:
+            return ""
+        try:
+            proc = subprocess.run(
+                ["ipconfig", "/all"],
+                capture_output=True,
+                timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            raw = proc.stdout  # bytes — não decodificamos ainda
+
+            saida = ""
+            for enc in ("cp850", "cp1252", "utf-8", "latin-1"):
+                try:
+                    saida = raw.decode(enc, errors="strict")
+                    break
+                except (UnicodeDecodeError, LookupError):
+                    continue
+            if not saida:
+                saida = raw.decode("utf-8", errors="replace")
+
+            # Normaliza quebras de linha do Windows (CRLF → LF)
+            saida = saida.replace("\r\n", "\n").replace("\r", "\n")
+
+            # Localiza o IP na saída
+            idx = saida.find(ip_local)
+            if idx == -1:
                 return ""
 
-        except Exception as erro:
-            print(f"[NetLab] _obter_cidr_via_ipconfig falhou: {erro}")
-            return ""
+            # Janela de contexto: 400 chars antes + 700 depois do IP
+            # (garante que o bloco do adaptador que contém o IP seja capturado)
+            trecho = saida[max(0, idx - 400): idx + 700]
+
+            # Regex genérico: aceita pt-BR, en-US e qualquer variação
+            # Captura qualquer linha com "Mask" ou "Mascara" seguida de um IP
+            m = re.search(
+                r"(?:M[aá]scara[^:]*|Subnet\s+Mask)[^:]*:\s*"
+                r"((?:25[0-5]|2[0-4]\d|[01]?\d\d?)(?:\.(?:25[0-5]|2[0-4]\d|[01]?\d\d?)){3})",
+                trecho,
+                re.IGNORECASE,
+            )
+            if m:
+                mascara = m.group(1)
+                prefixo = sum(bin(int(p)).count("1") for p in mascara.split("."))
+                rede = ipaddress.ip_network(f"{ip_local}/{prefixo}", strict=False)
+                return str(rede)
+
+        except Exception as e:
+            print(f"[NetLab] _obter_cidr_via_ipconfig: {e}")
+        return ""
 
     @staticmethod
     def _detectar_cidr_via_scapy(nome_interface: str) -> str:
@@ -1076,50 +1123,58 @@ class JanelaPrincipal(QMainWindow):
 
     def _cidr_da_interface(self, desc: str) -> str:
         """
-        Determina o CIDR da interface selecionada com quatro camadas de fallback:
-          1. Mapeamento interno (get_windows_if_list + máscara)
-          2. Scapy (get_if_addr / get_if_netmask)
-          3. ipconfig /all com busca por IP   ← CORREÇÃO principal
-          4. Estimativa /24 baseada no IP local
-        """
-        ip_interface = self._mapa_interface_ip.get(desc, "")
-        mascara      = self._mapa_interface_mascara.get(desc, "")
+        Detecta o CIDR da interface em ordem decrescente de confiabilidade.
 
-        # Fallback 1: mapeamento interno do Scapy
-        if ip_interface and mascara:
+        1. PowerShell Get-NetIPAddress  — independente de idioma, Windows 8+
+        2. ipconfig /all bytes+cp850    — corrige encoding pt-BR
+        3. Scapy mapeamento + máscara   — quando Scapy preenche netmasks
+        4. Scapy get_if_addr/netmask    — chamada direta por nome de dispositivo
+        5. Fallback /32                 — RESTRITIVO: só o próprio host é "local"
+           (nunca mais /24 estimado — isso era a causa dos 50 dispositivos falsos)
+        """
+        ip_interface = self._mapa_interface_ip.get(desc, "") or obter_ip_local()
+        if not ip_interface or ip_interface == "127.0.0.1":
+            return ""
+
+        # 1) PowerShell — mais confiável no Windows moderno (independe de idioma)
+        cidr = self._detectar_cidr_via_powershell(ip_interface)
+        if cidr:
+            self._status(f"✅ CIDR via PowerShell: {cidr}")
+            return cidr
+
+        # 2) ipconfig /all com encoding correto (cp850 para pt-BR)
+        cidr = self._obter_cidr_via_ipconfig(ip_interface)
+        if cidr:
+            self._status(f"✅ CIDR via ipconfig: {cidr}")
+            return cidr
+
+        # 3) Mapeamento interno do Scapy + máscara
+        mascara = self._mapa_interface_mascara.get(desc, "")
+        if mascara and '.' in mascara:
             try:
                 prefixo = self._mascara_para_prefixo(mascara)
                 rede    = ipaddress.ip_network(f"{ip_interface}/{prefixo}", strict=False)
+                self._status(f"✅ CIDR via Scapy mapeamento: {rede}")
                 return str(rede)
             except Exception:
                 pass
 
-        # Fallback 2: Scapy direto
+        # 4) Scapy direto pelo nome do dispositivo NPF
         nome_dispositivo = self._mapa_interface_nome.get(desc, desc)
-        cidr_scapy = self._detectar_cidr_via_scapy(nome_dispositivo)
-        if cidr_scapy:
-            return cidr_scapy
+        cidr = self._detectar_cidr_via_scapy(nome_dispositivo)
+        if cidr:
+            self._status(f"✅ CIDR via Scapy direto: {cidr}")
+            return cidr
 
-        # Fallback 3: ipconfig /all (localização por IP — mais robusto)
-        if ip_interface:
-            cidr_ipconfig = self._obter_cidr_via_ipconfig(ip_interface)
-            if cidr_ipconfig:
-                self._status(f"✅ CIDR detectado via ipconfig: {cidr_ipconfig}")
-                return cidr_ipconfig
-
-        # Fallback 4: estimativa /24 baseada no IP local
-        ip_base = ip_interface or obter_ip_local()
-        if ip_base:
-            partes = ip_base.split(".")
-            if len(partes) == 4:
-                rede_estimada = f"{partes[0]}.{partes[1]}.{partes[2]}.0/24"
-                self._status(
-                    f"⚠ Máscara não detectada para '{desc}'. "
-                    f"Usando {rede_estimada} como estimativa."
-                )
-                return rede_estimada
-
-        return ""
+        # 5) Fallback restritivo /32 — NUNCA mais /24 estimado
+        rede_restrita = f"{ip_interface}/32"
+        self._status(
+            f"⚠ Máscara não detectada para '{desc}'. "
+            f"Usando /32 ({rede_restrita}). "
+            f"Apenas este computador aparecerá como local; todos os outros "
+            f"como 'Internet'. Verifique a instalação do Npcap."
+        )
+        return rede_restrita
 
     def _parametros_iface_seguro(self, nome_iface: str) -> dict:
         """
@@ -1381,11 +1436,13 @@ class JanelaPrincipal(QMainWindow):
             tipo       = evento.get("tipo",       "")
 
             # Atualiza a topologia com os IPs do evento
-            if ip_origem:
+            if ip_origem and _ip_eh_topologizavel(ip_origem):
                 self.painel_topologia.adicionar_dispositivo(ip_origem, mac_origem)
-            if ip_destino:
+            if ip_destino and _ip_eh_topologizavel(ip_destino):
                 self.painel_topologia.adicionar_dispositivo(ip_destino, "")
-            if ip_origem and ip_destino:
+            if (ip_origem and ip_destino
+                    and _ip_eh_topologizavel(ip_origem)
+                    and _ip_eh_topologizavel(ip_destino)):
                 self.painel_topologia.adicionar_conexao(ip_origem, ip_destino)
 
             # Enfileira evento para exibição pedagógica (com cooldown)
@@ -1717,6 +1774,8 @@ class JanelaPrincipal(QMainWindow):
     @pyqtSlot(str, str, str)
     def _ao_encontrar_dispositivo(self, ip: str, mac: str, hostname: str):
         """Adiciona dispositivo descoberto à topologia e agenda evento pedagógico."""
+        if not _ip_eh_topologizavel(ip):
+            return
         self.painel_topologia.adicionar_dispositivo_manual(ip, mac, hostname)
         self.fila_eventos_ui.append({
             "tipo":       "NOVO_DISPOSITIVO",
