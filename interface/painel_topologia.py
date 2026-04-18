@@ -13,6 +13,7 @@
 #   - registrar_origem exige MAC válido (FIX-A)
 #   - Status de confiança CONFIRMADO (ARP) vs OBSERVADO (sniffer) (FIX-B)
 #   - registrar_conexao não cria nós implicitamente (FIX-C)
+#   - Integração com GerenciadorDispositivos para fabricante/apelido
 
 import math
 import time
@@ -23,13 +24,23 @@ from collections import defaultdict
 
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
-    QFrame, QPushButton
+    QFrame, QPushButton, QInputDialog
 )
 from PyQt6.QtCore import Qt, QPointF, QTimer, QRectF, QPoint
 from PyQt6.QtGui import (
     QPainter, QPen, QBrush, QColor, QFont,
     QRadialGradient, QCursor, QPainterPath, QFontMetrics
 )
+from utils.identificador import (
+    carregar_aliases,
+    chave_alias_dispositivo,
+    inferir_tipo_dispositivo,
+    obter_alias_persistido,
+    obter_caminho_aliases_padrao,
+    obter_fabricante,
+    salvar_aliases,
+)
+from utils.identificador import GerenciadorDispositivos   # PASSO 1 — novo import
 from utils.rede import obter_ip_local, eh_endereco_valido
 
 
@@ -86,15 +97,18 @@ class PainelDetalhes(QFrame):
 
         # Campos de informacao
         self._campos: Dict[str, QLabel] = {}
+        # PASSO 2 — campos_def atualizado com fabricante e apelido
         campos_def = [
-            ("ip",       "IP"),
-            ("mac",      "MAC"),
-            ("hostname", "Hostname"),
-            ("tipo",     "Tipo"),
-            ("pacotes",  "Trafego"),
-            ("portas",   "Portas"),
-            ("status",   "Status"),
-            ("confianca","Confiança"),   # novo campo do patch
+            ("ip",         "IP"),
+            ("mac",        "MAC"),
+            ("hostname",   "Hostname"),
+            ("tipo",       "Tipo"),
+            ("pacotes",    "Tráfego"),
+            ("portas",     "Portas"),
+            ("status",     "Status"),
+            ("confianca",  "Confiança"),
+            ("fabricante", "Fabricante"),   # NOVO
+            ("apelido",    "Apelido"),      # NOVO
         ]
         for chave, rotulo in campos_def:
             linha = QHBoxLayout()
@@ -114,7 +128,7 @@ class PainelDetalhes(QFrame):
     def exibir(self, ip: str, dados: dict, tipo: str, cor: QColor):
         self._lbl_tipo_icone.setText("●")
         self._lbl_tipo_icone.setStyleSheet(f"color: {cor.name()};")
-        nome = dados.get("hostname") or ip
+        nome = dados.get("alias") or dados.get("hostname") or dados.get("apelido") or ip
         titulo = nome[:22] + "..." if len(nome) > 22 else nome
         self._lbl_titulo.setText(titulo)
 
@@ -157,6 +171,34 @@ class PainelDetalhes(QFrame):
         else:
             self._campos["confianca"].setStyleSheet("color: #f39c12; font-size:10px;")
 
+        # PASSO 3 — Fabricante e Apelido
+        mac_disp = dados.get("mac") or ""
+        fabricante = dados.get("fabricante") or ""
+        if not fabricante and mac_disp:
+            try:
+                from utils.identificador import GerenciadorDispositivos
+                fabricante = GerenciadorDispositivos().identificar_fabricante(mac_disp)
+            except Exception:
+                fabricante = "---"
+        self._campos["fabricante"].setText(fabricante or "---")
+        self._campos["fabricante"].setStyleSheet(
+            "color: #3498DB; font-size:10px;" if fabricante and fabricante != "Desconhecido"
+            else "color: #95a5a6; font-size:10px;"
+        )
+
+        apelido = dados.get("apelido") or ""
+        if not apelido and mac_disp:
+            try:
+                from utils.identificador import GerenciadorDispositivos
+                apelido = GerenciadorDispositivos().obter_apelido(mac_disp)
+            except Exception:
+                apelido = ""
+        self._campos["apelido"].setText(apelido or "---")
+        self._campos["apelido"].setStyleSheet(
+            "color: #F39C12; font-weight:bold; font-size:10px;" if apelido
+            else "color: #95a5a6; font-size:10px;"
+        )
+
         self.adjustSize()
         self.show()
 
@@ -179,13 +221,12 @@ class VisualizadorTopologia(QWidget):
     RAIO_BASE       = 16
     RAIO_MIN        = 7
     RAIO_MAX        = 30
-    MAX_DISPOSITIVOS = 50               # Limite realista: apenas dispositivos com tráfego real
+    MAX_DISPOSITIVOS = 50
     TIMEOUT_INATIVIDADE = 1800
 
-    # Conjunto de MACs inválidos que nunca representam um host real (PATCH)
     _MACS_INVALIDOS = frozenset({
-        "ff:ff:ff:ff:ff:ff",  # broadcast
-        "00:00:00:00:00:00",  # nulo
+        "ff:ff:ff:ff:ff:ff",
+        "00:00:00:00:00:00",
         "",
     })
 
@@ -196,11 +237,13 @@ class VisualizadorTopologia(QWidget):
         self.contagem_conexoes: Dict[Tuple, int]  = defaultdict(int)
         self._posicoes_mundo: Dict[str, QPointF]  = {}
         self._ip_local = obter_ip_local()
-        self._rede_local = None  # ipaddress.ip_network
+        self._rede_local = None
         self.subredes: Dict[str, dict] = {}
         self._subrede_por_ip: Dict[str, str] = {}
-        self._ultimo_trafego: Dict[str, float]    = {}  # timestamp da última atividade
-        self._lock_dispositivos = threading.Lock()  # Lock para acesso thread-safe
+        self._arquivo_aliases = obter_caminho_aliases_padrao()
+        self._aliases_persistidos = carregar_aliases(self._arquivo_aliases)
+        self._ultimo_trafego: Dict[str, float]    = {}
+        self._lock_dispositivos = threading.Lock()
 
         self._zoom       = 1.0
         self._offset     = QPointF(0, 0)
@@ -210,68 +253,101 @@ class VisualizadorTopologia(QWidget):
         self._no_hover: Optional[str]      = None
         self._no_selecionado: Optional[str] = None
 
-        # callback externo chamado ao clicar em um no
         self.on_no_clicado = None
 
         self._fase_animacao = 0
         timer = QTimer(self)
         timer.timeout.connect(self._passo_animacao)
-        # 33ms ≈ 30fps — animação fluida, ainda leve para a CPU.
         timer.start(33)
 
-        # Debounce do recalculo de layout — chama no máximo 1x a cada 800ms,
-        # independentemente de quantos novos IPs chegarem nesse intervalo.
         self._timer_layout = QTimer(self)
         self._timer_layout.setSingleShot(True)
         self._timer_layout.setInterval(800)
         self._timer_layout.timeout.connect(self._recalcular_layout)
 
-        # Timer para remover dispositivos inativos a cada minuto
         self._timer_limpeza = QTimer(self)
         self._timer_limpeza.timeout.connect(self._remover_inativos)
-        self._timer_limpeza.start(60_000)  # verifica a cada minuto
+        self._timer_limpeza.start(60_000)
 
         self.setMouseTracking(True)
         self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
         self.setMinimumSize(500, 350)
-        # Evita repintura do fundo pelo Qt antes do nosso draw → menos overdraw.
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
 
     # ── Interface publica ──────────────────────────────────────────────────
 
     def _mac_e_valido(self, mac: str) -> bool:
-        """
-        Verifica se o MAC representa um host real.
-        Rejeita broadcast, nulo e strings vazias.
-        """
         if not mac or mac.lower() in self._MACS_INVALIDOS:
             return False
-        # MAC deve ter pelo menos 11 chars (formato xx:xx:xx:xx:xx:xx)
         return len(mac.replace(":", "").replace("-", "")) == 12
+
+    def _nome_preferencial_dispositivo(self, dados: dict, ip: str) -> str:
+        return dados.get("apelido") or dados.get("alias") or dados.get("hostname") or ip
+
+    def _persistir_alias_dispositivo(self, ip: str):
+        if ip not in self.dispositivos or ip == "internet":
+            return
+
+        dados = self.dispositivos[ip]
+        alias = (dados.get("alias") or "").strip()
+        chave_mac = chave_alias_dispositivo(mac=dados.get("mac", ""))
+        chave_ip = chave_alias_dispositivo(ip=ip)
+
+        for chave in (chave_mac, chave_ip):
+            if not chave:
+                continue
+            if alias:
+                self._aliases_persistidos[chave] = alias
+            else:
+                self._aliases_persistidos.pop(chave, None)
+
+        salvar_aliases(self._arquivo_aliases, self._aliases_persistidos)
+
+    def _sincronizar_metadados_dispositivo(self, ip: str):
+        if ip not in self.dispositivos:
+            return
+
+        dados = self.dispositivos[ip]
+        if ip == "internet":
+            dados.setdefault("alias", "")
+            dados["fabricante"] = "Externo"
+            dados["tipo_identificado"] = "Externo / Internet"
+            return
+
+        alias_persistido = obter_alias_persistido(
+            self._aliases_persistidos,
+            mac=dados.get("mac", ""),
+            ip=ip,
+        )
+        if "alias" not in dados:
+            dados["alias"] = alias_persistido or ""
+        elif not dados.get("alias") and alias_persistido:
+            dados["alias"] = alias_persistido
+
+        fabricante = obter_fabricante(dados.get("mac", ""))
+        dados["fabricante"] = fabricante
+        dados["tipo_identificado"] = inferir_tipo_dispositivo(
+            ip=ip,
+            mac=dados.get("mac", ""),
+            hostname=dados.get("hostname", ""),
+            fabricante=fabricante,
+            eh_gateway=self._ip_eh_gateway(ip),
+            eh_local=(ip == self._ip_local),
+        )
+
+    def _definir_alias_dispositivo(self, ip: str, alias: str):
+        if ip not in self.dispositivos or ip == "internet":
+            return
+
+        self.dispositivos[ip]["alias"] = (alias or "").strip()
+        self._persistir_alias_dispositivo(ip)
 
     def registrar_origem(self, ip: str, mac: str = "", hostname: str = "",
                          confirmado_por_arp: bool = False, cidr: str = ""):
-        """
-        Registra uma origem de tráfego na topologia.
-
-        REGRA FUNDAMENTAL:
-          • Sem MAC válido → dispositivo NÃO é criado.
-          • ip_destino nunca deve chamar este método.
-
-        Parâmetros:
-            ip: endereço IP de origem (obrigatório)
-            mac: endereço MAC de origem (obrigatório para criar nó)
-            hostname: nome do host (opcional)
-            confirmado_por_arp: True quando a fonte é ARP reply (mais confiável)
-        """
         if not eh_endereco_valido(ip):
             return
 
-        # [FIX-A] Segunda barreira: MAC obrigatório para criar ou atualizar nó.
-        #         Sem MAC não há evidência de camada 2 — dispositivo ignorado.
         if not self._mac_e_valido(mac):
-            # Exceção: se o nó JÁ existe (descoberto via ARP antes), apenas
-            # incrementa o contador de pacotes sem exigir MAC novamente.
             chave = ip if (ip in self._subrede_por_ip or self._pertence_rede(ip)) else "internet"
             with self._lock_dispositivos:
                 if chave in self.dispositivos:
@@ -281,14 +357,11 @@ class VisualizadorTopologia(QWidget):
 
         chave = self._resolver_chave_no(ip, cidr)
         agora = time.time()
-
-        # [FIX-B] Status de confiança: ARP reply > sniffer passivo
         status_confianca = "CONFIRMADO" if confirmado_por_arp else "OBSERVADO"
 
         with self._lock_dispositivos:
             self._ultimo_trafego[chave] = agora
 
-            # Nó "Internet" não segue limite de 50 e não exige MAC
             if chave == "internet":
                 if chave not in self.dispositivos:
                     self.dispositivos[chave] = {
@@ -299,12 +372,12 @@ class VisualizadorTopologia(QWidget):
                         "portas":     set(),
                         "confianca":  "CONFIRMADO",
                     }
+                    self._sincronizar_metadados_dispositivo(chave)
                     if not self._timer_layout.isActive():
                         self._timer_layout.start()
                 self.dispositivos[chave]["pacotes"] += 1
                 return
 
-            # Nó local já existe → atualiza sem recriar
             if chave in self.dispositivos:
                 self.dispositivos[chave]["pacotes"] += 1
                 if mac:
@@ -313,16 +386,13 @@ class VisualizadorTopologia(QWidget):
                     self.dispositivos[chave]["hostname"] = hostname
                 if cidr:
                     self.dispositivos[chave]["subrede"] = cidr
-                # Promove para CONFIRMADO se veio de ARP
                 if confirmado_por_arp:
                     self.dispositivos[chave]["confianca"] = "CONFIRMADO"
+                self._sincronizar_metadados_dispositivo(chave)
                 return
 
-            # Nó local novo → verifica limite e cria
             locais_atuais = [k for k in self.dispositivos if k != "internet"]
-
             if len(locais_atuais) >= self.MAX_DISPOSITIVOS:
-                # Remove o menos ativo (menor contador de pacotes)
                 candidatos_remocao = [
                     chave for chave in locais_atuais
                     if self.dispositivos.get(chave, {}).get("confianca") != "CONFIRMADO"
@@ -338,7 +408,6 @@ class VisualizadorTopologia(QWidget):
                 self._ultimo_trafego.pop(menos_ativo, None)
                 self._remover_ip_de_subredes(menos_ativo)
 
-            # Cria o novo nó com MAC validado
             self.dispositivos[chave] = {
                 "ip":        chave,
                 "mac":       mac,
@@ -348,19 +417,13 @@ class VisualizadorTopologia(QWidget):
                 "confianca": status_confianca,
                 "subrede":   cidr or self._subrede_por_ip.get(ip, ""),
             }
+            self._sincronizar_metadados_dispositivo(chave)
 
             if not self._timer_layout.isActive():
                 self._timer_layout.start()
 
     def registrar_conexao(self, ip_origem: str, ip_destino: str,
                           porta_origem: int = 0, porta_destino: int = 0):
-        """
-        Registra uma aresta entre dois nós existentes.
-
-        [FIX-C] IMPORTANTE: este método NUNCA cria novos dispositivos.
-        Se um dos endpoints não existir na topologia, a aresta é ignorada.
-        Isso evita que ip_destino infle o grafo com nós fantasmas.
-        """
         if not eh_endereco_valido(ip_origem) or not eh_endereco_valido(ip_destino):
             return
 
@@ -370,9 +433,6 @@ class VisualizadorTopologia(QWidget):
         if no_a == no_b:
             return
 
-        # [FIX-C] Ambos os nós devem existir previamente — sem criação implícita.
-        #         Se ip_destino não foi descoberto por ARP ou sniffer com MAC,
-        #         a conexão não é desenhada (correto — host não confirmado).
         with self._lock_dispositivos:
             if no_a not in self.dispositivos or no_b not in self.dispositivos:
                 return
@@ -388,16 +448,10 @@ class VisualizadorTopologia(QWidget):
 
     def adicionar_dispositivo_manual(self, ip: str, mac: str = "",
                                      hostname: str = ""):
-        """
-        Chamado pela varredura ARP ativa — fonte de maior confiança.
-        Passa confirmado_por_arp=True para elevar o status do nó.
-        """
         self.registrar_origem(ip, mac, hostname, confirmado_por_arp=True)
 
     def atualizar_subredes(self, lista_subredes):
-        """Sincroniza a visualizacao com a lista atual de sub-redes conhecidas."""
         cidrs_recebidos = set()
-
         for subrede in lista_subredes:
             cidr = subrede.cidr
             cidrs_recebidos.add(cidr)
@@ -409,18 +463,15 @@ class VisualizadorTopologia(QWidget):
                 "hosts": set(subrede.hosts),
                 "local": bool(getattr(subrede, "local", False)) or info_atual.get("local", False),
             }
-
         for cidr in list(self.subredes):
             if cidr not in cidrs_recebidos:
                 del self.subredes[cidr]
-
         self._reconstruir_mapa_subredes()
         if not self._timer_layout.isActive():
             self._timer_layout.start()
         self.update()
 
     def _reconstruir_mapa_subredes(self):
-        """Reconstrui o indice rapido IP -> CIDR a partir do estado atual."""
         self._subrede_por_ip.clear()
         for ip, dados in self.dispositivos.items():
             if ip != "internet":
@@ -432,7 +483,6 @@ class VisualizadorTopologia(QWidget):
                     self.dispositivos[ip]["subrede"] = cidr
 
     def _registrar_ip_em_subrede(self, ip: str, cidr: str):
-        """Associa um IP a uma sub-rede ja conhecida pelo painel."""
         if not ip or not cidr:
             return
         info_subrede = self.subredes.setdefault(
@@ -449,14 +499,6 @@ class VisualizadorTopologia(QWidget):
         self._subrede_por_ip[ip] = cidr
 
     def _resolver_chave_no(self, ip: str, cidr: str = "") -> str:
-        """
-        Decide se o IP vira um no individual ou deve ser agrupado como internet.
-
-        Regras:
-        - CIDR explicito vence.
-        - Hosts de qualquer sub-rede conhecida ficam individualizados.
-        - Enderecos fora de segmentos conhecidos continuam agrupados em internet.
-        """
         if cidr:
             self._registrar_ip_em_subrede(ip, cidr)
             return ip
@@ -467,7 +509,6 @@ class VisualizadorTopologia(QWidget):
         return "internet"
 
     def _remover_ip_de_subredes(self, ip: str):
-        """Remove um host do mapa de sub-redes sem destruir o segmento em si."""
         cidr = self._subrede_por_ip.pop(ip, "")
         if not cidr:
             return
@@ -485,7 +526,6 @@ class VisualizadorTopologia(QWidget):
         hostname: str = "",
         confirmado_por_arp: bool = False,
     ):
-        """Adiciona ou atualiza um dispositivo explicitamente associado a uma sub-rede."""
         info_subrede = self.subredes.setdefault(
             cidr,
             {
@@ -521,18 +561,15 @@ class VisualizadorTopologia(QWidget):
     # ── Gerenciamento de dispositivos (expiração e limite prático) ────────
 
     def _obter_dispositivos_locais(self) -> list:
-        """Retorna lista de IPs locais (exclui 'internet')."""
         return [k for k in self.dispositivos if k != "internet"]
 
     def _remover_menos_ativo(self):
-        """Remove o dispositivo local com menor contagem de pacotes."""
         locais = [
             ip for ip in self._obter_dispositivos_locais()
             if self.dispositivos.get(ip, {}).get("confianca") != "CONFIRMADO"
         ]
         if not locais:
             return
-        # Encontra o IP com menor número de pacotes
         menos_ativo = min(locais, key=lambda ip: self.dispositivos[ip]["pacotes"])
         del self.dispositivos[menos_ativo]
         self._posicoes_mundo.pop(menos_ativo, None)
@@ -540,7 +577,6 @@ class VisualizadorTopologia(QWidget):
         self._remover_ip_de_subredes(menos_ativo)
 
     def _remover_inativos(self):
-        """Remove dispositivos sem tráfego há mais de 5 minutos."""
         agora = time.time()
         inativos = [
             ip for ip, ts in self._ultimo_trafego.items()
@@ -560,7 +596,6 @@ class VisualizadorTopologia(QWidget):
             del self._ultimo_trafego[ip]
             self._remover_ip_de_subredes(ip)
 
-        # Recalcula layout se removeu algo
         if not self._timer_layout.isActive():
             self._timer_layout.start()
 
@@ -611,6 +646,28 @@ class VisualizadorTopologia(QWidget):
     def mouseReleaseEvent(self, evento):
         self._drag_inicio = None
 
+    def mouseDoubleClickEvent(self, evento):
+        ip = self._no_em(evento.position())
+        if not ip or ip == "internet" or ip not in self.dispositivos:
+            return
+
+        alias_atual = self.dispositivos[ip].get("alias", "")
+        novo_alias, confirmou = QInputDialog.getText(
+            self,
+            "Apelido do dispositivo",
+            f"Definir um apelido para {ip}:",
+            text=alias_atual,
+        )
+        if not confirmou:
+            return
+
+        self._definir_alias_dispositivo(ip, novo_alias)
+        self._sincronizar_metadados_dispositivo(ip)
+        self._no_selecionado = ip
+        if self.on_no_clicado:
+            self.on_no_clicado(ip)
+        self.update()
+
     def _resetar_vista(self):
         self._zoom   = 1.0
         self._offset = QPointF(0, 0)
@@ -618,12 +675,10 @@ class VisualizadorTopologia(QWidget):
         self.update()
 
     def definir_mostrar_subredes(self, mostrar: bool):
-        """Controla a renderizacao opcional das sub-redes."""
         self._mostrar_subredes = bool(mostrar)
         self.update()
 
     def definir_rede_local(self, cidr: str):
-        """Define a rede local (CIDR) para filtrar nós fora da LAN."""
         try:
             import ipaddress
             self._rede_local = ipaddress.ip_network(cidr, strict=False) if cidr else None
@@ -636,17 +691,6 @@ class VisualizadorTopologia(QWidget):
             self.subredes[cidr]["local"] = True
 
     def _pertence_rede(self, ip: str) -> bool:
-        """
-        Verifica se um IP pertence à sub-rede física da interface capturada.
-
-        Regra de decisão:
-          • CIDR configurado  → ipaddress puro, sem ambiguidade.
-          • CIDR ausente      → aceita APENAS o IP do próprio host (_ip_local).
-            Isso é deliberadamente restritivo: evita que endereços de VMs,
-            VPNs, adaptadores virtuais (Docker, Hyper-V, VMware) sejam
-            classificados como dispositivos da LAN física enquanto o CIDR
-            ainda não foi resolvido.
-        """
         if not ip or not eh_endereco_valido(ip):
             return False
 
@@ -656,7 +700,6 @@ class VisualizadorTopologia(QWidget):
             except Exception:
                 return False
 
-        # Sem CIDR: somente o próprio host é "local"
         return ip == self._ip_local
 
     # ── Desenho ────────────────────────────────────────────────────────────
@@ -728,7 +771,6 @@ class VisualizadorTopologia(QWidget):
             p.drawLine(self._posicoes_mundo[no_a], self._posicoes_mundo[no_b])
 
     def _estilo_subrede(self, visibilidade: str) -> tuple:
-        """Retorna as cores e o estilo de linha usados para a sub-rede."""
         if visibilidade == "total":
             return (
                 QColor(46, 204, 113, 200),
@@ -748,7 +790,6 @@ class VisualizadorTopologia(QWidget):
         )
 
     def _texto_subrede(self, info_subrede: dict) -> str:
-        """Monta o rotulo textual da sub-rede para a interface."""
         texto = info_subrede.get("cidr", "")
         gateway = info_subrede.get("gateway")
         visibilidade = info_subrede.get("visibilidade", "inferida")
@@ -758,7 +799,6 @@ class VisualizadorTopologia(QWidget):
         return texto
 
     def _pintar_subredes(self, p: QPainter):
-        """Desenha grupos de sub-rede para hosts que ja possuem posicao no grafo."""
         if not self.subredes:
             return
 
@@ -799,12 +839,6 @@ class VisualizadorTopologia(QWidget):
             )
 
     def _pintar_subredes_sem_hosts(self, p: QPainter):
-        """
-        Desenha placeholders honestos para sub-redes inferidas sem hosts confirmados.
-
-        Isso evita esconder segmentos conhecidos so porque ainda nao existem
-        endpoints suficientes para formar uma caixa ao redor de nos reais.
-        """
         subredes_sem_hosts = [
             info_subrede
             for info_subrede in self.subredes.values()
@@ -923,7 +957,7 @@ class VisualizadorTopologia(QWidget):
 
             # Nome abaixo do no
             if raio >= 16 and not desfocado:
-                nome = "Internet" if ip == "internet" else (dados.get("hostname") or ip)
+                nome = "Internet" if ip == "internet" else self._nome_preferencial_dispositivo(dados, ip)
                 if len(nome) > 18:
                     nome = nome[:16] + "..."
                 p.setPen(QPen(self.COR_LEGENDA))
@@ -972,7 +1006,7 @@ class VisualizadorTopologia(QWidget):
 
         ip    = self._no_hover
         dados = self.dispositivos.get(ip, {})
-        nome  = dados.get("hostname") or ""
+        nome  = self._nome_preferencial_dispositivo(dados, ip) if ip != "internet" else ""
         if ip == "internet":
             txt = "Internet (IPs externos)"
         elif nome and nome != ip:
@@ -1018,7 +1052,7 @@ class VisualizadorTopologia(QWidget):
         p.drawText(
             QRectF(8, self.height() - 16, 350, 13),
             Qt.AlignmentFlag.AlignLeft,
-            "Scroll: zoom  |  Arrastar: mover  |  Clicar no: detalhes  |  Botao dir.: resetar"
+            "Scroll: zoom  |  Arrastar: mover  |  Clique: detalhes  |  Duplo clique: apelido"
         )
 
     # ── Utilitarios internos ───────────────────────────────────────────────
@@ -1033,6 +1067,9 @@ class VisualizadorTopologia(QWidget):
         return self.COR_NO_NORMAL
 
     def _tipo_do_no(self, ip: str) -> str:
+        dados = self.dispositivos.get(ip, {})
+        if dados.get("tipo_identificado"):
+            return dados["tipo_identificado"]
         if ip == "internet":
             return "Externo / Internet"
         if ip == self._ip_local:
@@ -1042,18 +1079,15 @@ class VisualizadorTopologia(QWidget):
         return "Dispositivo local"
 
     def _ip_eh_gateway(self, ip: str) -> bool:
-        """Detecta gateways conhecidos sem depender apenas do sufixo do endereco."""
         for info_subrede in self.subredes.values():
             if info_subrede.get("gateway") == ip:
                 return True
         return ip.endswith(".1") or ip.endswith(".254")
 
     def total_dispositivos_nao_internet(self) -> int:
-        """Conta os nos presentes na topologia, excluindo o agrupador Internet."""
         return sum(1 for ip in self.dispositivos if ip != "internet")
 
     def _raio_do_no(self, ip: str) -> float:
-        """Raio cresce logaritmicamente com o volume de trafego."""
         pacotes = self.dispositivos.get(ip, {}).get("pacotes", 0)
         if pacotes <= 0:
             return float(self.RAIO_BASE)
@@ -1083,10 +1117,6 @@ class VisualizadorTopologia(QWidget):
         return None
 
     def _recalcular_layout(self):
-        """
-        Distribui nos em multiplos aneis concentricos no espaco-mundo,
-        depois aplica auto-zoom para preencher a area visivel.
-        """
         locais   = [ip for ip in self.dispositivos if ip != "internet"]
         tem_inet = "internet" in self.dispositivos
         n        = len(locais)
@@ -1123,7 +1153,6 @@ class VisualizadorTopologia(QWidget):
         self._auto_zoom()
 
     def _auto_zoom(self):
-        """Calcula zoom e offset para que todos os nos preencham a area."""
         if not self._posicoes_mundo:
             return
 
@@ -1152,10 +1181,6 @@ class VisualizadorTopologia(QWidget):
 
     def _passo_animacao(self):
         self._fase_animacao += 1
-        # Redesenha apenas quando necessário:
-        #   • Sempre que o nó local existir (pulso animado precisa de update contínuo)
-        #   • A cada 4 ticks (~400ms) para manter hover/tooltip responsivos
-        #     sem redesenhar a cada 100ms quando não há animação ativa.
         if self._ip_local and self._ip_local in self._posicoes_mundo:
             self.update()
         elif self._fase_animacao % 4 == 0:
@@ -1173,13 +1198,14 @@ class PainelTopologia(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._montar_layout()
+        # PASSO 4 — Instanciar o GerenciadorDispositivos
+        self.gerenciador = GerenciadorDispositivos()
 
     def _montar_layout(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Wrapper para sobrepor o painel de detalhes ao canvas
         self._area = QWidget()
         self._area.setMinimumSize(500, 350)
 
@@ -1209,7 +1235,6 @@ class PainelTopologia(QWidget):
 
     def resizeEvent(self, evento):
         super().resizeEvent(evento)
-        # Fazer o visualizador preencher toda a area
         self.visualizador.setGeometry(0, 0,
                                       self._area.width(),
                                       self._area.height())
@@ -1233,27 +1258,67 @@ class PainelTopologia(QWidget):
 
     # ── Metodos publicos usados pela janela principal ──────────────────────
 
+    # PASSO 5 — Versões atualizadas de adicionar_dispositivo e adicionar_dispositivo_manual
     def adicionar_dispositivo(self, ip: str, mac: str = "", hostname: str = ""):
         """
-        Chamado durante a captura passiva (sniffer).
-        MAC obrigatório — sem MAC o nó não é criado (regra de ouro).
+        Registra um dispositivo observado via captura passiva (sniffer).
+        Enriquece os dados com fabricante OUI e apelido personalizado.
         """
-        # confirmado_por_arp=False pois veio do sniffer, não de ARP reply
-        self.visualizador.registrar_origem(ip, mac, hostname,
-                                           confirmado_por_arp=False)
+        fabricante = self.gerenciador.identificar_fabricante(mac) if mac else ""
+        apelido    = self.gerenciador.obter_apelido(mac)          if mac else ""
+
+        self.visualizador.registrar_origem(
+            ip, mac, hostname or apelido,
+            confirmado_por_arp=False,
+        )
+
+        if ip in self.visualizador.dispositivos:
+            self.visualizador.dispositivos[ip]["fabricante"] = fabricante
+            self.visualizador.dispositivos[ip]["apelido"]    = apelido
+
+    def adicionar_dispositivo_manual(self, ip: str, mac: str = "", hostname: str = ""):
+        """
+        Registra um dispositivo descoberto via varredura ARP ativa.
+        Fonte primária e confiável — enriquece com OUI e apelido.
+        """
+        fabricante = self.gerenciador.identificar_fabricante(mac) if mac else ""
+        apelido    = self.gerenciador.obter_apelido(mac)          if mac else ""
+
+        self.visualizador.registrar_origem(
+            ip, mac, hostname or apelido,
+            confirmado_por_arp=True,
+        )
+
+        if ip in self.visualizador.dispositivos:
+            self.visualizador.dispositivos[ip]["fabricante"] = fabricante
+            self.visualizador.dispositivos[ip]["apelido"]    = apelido
+
+    # PASSO 6 — Novo método público para salvar apelido
+    def definir_apelido_dispositivo(self, mac: str, apelido: str):
+        """
+        Define um apelido personalizado para o dispositivo.
+
+        O apelido é persistido em JSON e exibido na topologia
+        como nome do nó (quando disponível).
+
+        Args:
+            mac:    endereço MAC do dispositivo.
+            apelido: nome amigável (ex.: "Notebook do Professor").
+        """
+        self.gerenciador.salvar_apelido(mac, apelido)
+
+        for ip, dados in self.visualizador.dispositivos.items():
+            if dados.get("mac", "").upper() == mac.upper():
+                dados["apelido"] = apelido
+                break
+
+        self.visualizador.update()
 
     def adicionar_conexao(self, ip_origem: str, ip_destino: str,
                           porta_origem: int = 0, porta_destino: int = 0):
         self.visualizador.registrar_conexao(
             ip_origem, ip_destino, porta_origem, porta_destino
         )
-
-    def adicionar_dispositivo_manual(self, ip: str, mac: str = "", hostname: str = ""):
-        """
-        Chamado pela varredura ARP ativa — fonte primária e confiável.
-        """
-        self.visualizador.registrar_origem(ip, mac, hostname,
-                                           confirmado_por_arp=True)
 
     def adicionar_dispositivo_com_subrede(
         self,
@@ -1275,11 +1340,9 @@ class PainelTopologia(QWidget):
         self.visualizador.update()
 
     def definir_mostrar_subredes(self, mostrar: bool):
-        """Mostra ou oculta as sub-redes sem perder os dados coletados."""
         self.visualizador.definir_mostrar_subredes(mostrar)
 
     def definir_rede_local(self, cidr: str):
-        """Define rede local para filtrar o que é exibido na topologia."""
         self.visualizador.definir_rede_local(cidr)
 
     def limpar(self):
@@ -1287,11 +1350,9 @@ class PainelTopologia(QWidget):
         self.visualizador.limpar()
 
     def total_dispositivos(self) -> int:
-        """Retorna total de nós renderizados (ativos + descobertos)."""
         return self.visualizador.total_dispositivos_nao_internet()
 
     def total_dispositivos_ativos(self) -> int:
-        """Conta apenas nós que já trafegaram pacotes."""
         return sum(
             1
             for ip, d in self.visualizador.dispositivos.items()

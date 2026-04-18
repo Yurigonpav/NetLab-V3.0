@@ -1,4 +1,5 @@
-﻿# interface/janela_principal.py
+﻿
+# interface/janela_principal.py
 
 import threading
 import time
@@ -28,6 +29,7 @@ from painel_servidor import PainelServidor
 from utils.constantes import PORTAS_HTTP, PORTAS_DHCP
 from utils.gerenciador_subredes import GerenciadorSubRedes, Visibilidade
 from utils.rede import obter_ip_local
+from utils.identificador import GerenciadorDispositivos
 
 
 # ============================================================================
@@ -688,6 +690,9 @@ class JanelaPrincipal(QMainWindow):
 
         self.estado_rede = EstadoRede()
         self.gerenciador_subredes = GerenciadorSubRedes()
+        # Gerenciador de identificação de fabricantes via OUI (Singleton)
+        # Inicializado uma única vez; compartilhado com painel_topologia
+        self.gerenciador_dispositivos = GerenciadorDispositivos()
         self.fila_eventos_ui: deque = deque(maxlen=500)
         self.eventos_mostrados_recentemente: deque = deque(maxlen=200)
 
@@ -762,6 +767,16 @@ class JanelaPrincipal(QMainWindow):
         self.acao_captura.setShortcut("F5")
         self.acao_captura.triggered.connect(self._alternar_captura)
         m_mon.addAction(self.acao_captura)
+
+        # ── Menu: Atualizar base OUI ──────────────────────────────────────
+        m_mon.addSeparator()
+        a_atualizar_oui = QAction("🔄 Atualizar Base de Fabricantes", self)
+        a_atualizar_oui.setToolTip(
+            "Baixa a base OUI mais recente do Wireshark (requer internet).\n"
+            "A identificação de fabricantes em dispositivos novos será aprimorada."
+        )
+        a_atualizar_oui.triggered.connect(self._solicitar_atualizacao_base_oui)
+        m_mon.addAction(a_atualizar_oui)
 
         m_ajd = menu.addMenu("&Ajuda")
         a_sobre = QAction("Sobre o NetLab", self)
@@ -1891,8 +1906,39 @@ class JanelaPrincipal(QMainWindow):
             "identificação via MAC/OUI e monitoramento em tempo real.</p>"
             "<p><b>Autor:</b> Yuri Gonçalves Pavão</p>"
             "<p><b>Instagram:</b> @yuri_g0n | "
-            "<b>GitHub:</b> github.com/yurigonpav</p>"
+            "<b>GitHub:</b> github.com/Yurigonpav</p>"
         )
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Atualização da base OUI de fabricantes
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _solicitar_atualizacao_base_oui(self):
+        """
+        Versão simplificada: usa QTimer.singleShot para redirecionar
+        o callback para a UI thread de forma segura no PyQt6.
+        """
+        self._status("🔄 Baixando base de fabricantes do Wireshark… (em segundo plano)")
+
+        def ao_concluir(sucesso: bool, mensagem: str):
+            # Agenda execução na UI thread via QTimer (thread-safe)
+            self._resultado_atualizacao_oui = (sucesso, mensagem)
+            QTimer.singleShot(0, self._ao_concluir_atualizacao_oui)
+
+        self.gerenciador_dispositivos.atualizar_base_wireshark(
+            callback_conclusao=ao_concluir
+        )
+
+    @pyqtSlot()
+    def _ao_concluir_atualizacao_oui(self):
+        sucesso, mensagem = getattr(self, "_resultado_atualizacao_oui", (False, ""))
+
+        if sucesso:
+            self._status(f"✅ {mensagem}")
+            QMessageBox.information(self, "Base OUI Atualizada", f"✅ {mensagem}")
+        else:
+            self._status(f"⚠ Falha: {mensagem}")
+            QMessageBox.warning(self, "Falha na Atualização", mensagem)
 
     def closeEvent(self, evento):
         self._finalizar_workers()

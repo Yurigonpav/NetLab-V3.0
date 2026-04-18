@@ -3,3 +3,4 @@ scapy
 pyqtgraph
 cryptography
 reportlab
+manuf        # ← NOVO: base OUI do Wireshark
